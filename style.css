@@ -510,6 +510,34 @@ main {
   word-break: break-all;
 }
 
+.texture-validation {
+  margin-top: 6px;
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font-size: 10px;
+  line-height: 1.35;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+}
+
+.texture-validation.hidden { display: none; }
+.texture-validation.ok {
+  border-color: var(--success);
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 10%, var(--surface2));
+}
+.texture-validation.warn {
+  border-color: #f59e0b;
+  color: #f59e0b;
+  background: color-mix(in srgb, #f59e0b 15%, var(--surface2));
+}
+.texture-validation.error {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface2));
+}
+
 /* ── Form rows ───────────────────────────────────────────────────────── */
 .form-row {
   display: flex;
