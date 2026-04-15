@@ -148,6 +148,8 @@ php -S localhost:8000
 Open http://localhost:8000 in your browser and you're ready to go.
 
 > **Tip:** Any static server will work — the app has no server-side dependencies.
+>
+> **Troubleshooting:** If you open `index.html` directly via `file://`, model/texture upload may appear to do nothing because browsers block ES module loading and file access in that mode. Always use a local HTTP server.
 
 ## Dependencies
 

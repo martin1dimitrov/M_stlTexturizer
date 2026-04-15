@@ -465,6 +465,28 @@
     </div>
   </div>
 
+  <script>
+    // Running directly from file:// breaks module imports and file loading in most browsers.
+    (function () {
+      if (location.protocol !== 'file:') return;
+      const warningText = 'BumpMesh cannot run reliably from file://. Start a local server (e.g. "python -m http.server 8000"), then open http://localhost:8000';
+      window.addEventListener('DOMContentLoaded', () => {
+        const banner = document.createElement('div');
+        banner.id = 'local-server-warning';
+        banner.textContent = warningText;
+        document.body.prepend(banner);
+
+        const wireInputWarning = (id) => {
+          const input = document.getElementById(id);
+          if (!input) return;
+          input.addEventListener('click', () => alert(warningText));
+          input.addEventListener('change', () => alert(warningText));
+        };
+        wireInputWarning('stl-file-input');
+        wireInputWarning('texture-file-input');
+      });
+    })();
+  </script>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

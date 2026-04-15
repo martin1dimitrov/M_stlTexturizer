@@ -130,6 +130,21 @@ html, body {
   overflow: hidden;
 }
 
+#local-server-warning {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10000;
+  padding: 10px 14px;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+  color: #fff;
+  background: #c0392b;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.25);
+}
+
 /* ── Header ─────────────────────────────────────────────────────────── */
 header {
   height: var(--header-h);
