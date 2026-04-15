@@ -2233,6 +2233,125 @@ function updateMeshDiagnostics(adjData, triCount) {
   renderExportValidation();
 }
 
+function _formatEstimateRange(range, opts = {}) {
+  const formatter = new Intl.NumberFormat(undefined, opts);
+  return `${formatter.format(Math.round(range.low))}–${formatter.format(Math.round(range.high))}`;
+}
+
+function _estimateExportRanges() {
+  if (!currentGeometry?.attributes?.position) return null;
+
+  const triangleCount = currentGeometry.attributes.position.count / 3;
+  const maxTriangles = Math.max(1, settings.maxTriangles || triangleCount || 1);
+  const refineLength = Math.max(1e-4, settings.refineLength || 1);
+
+  // Reuse the same edge-ratio heuristic as precision masking, then apply a
+  // broad uncertainty band to avoid false precision.
+  const heuristicPre = estimateSubdivisionTriCount(currentGeometry, refineLength);
+  const conservativeFloor = triangleCount;
+  const estimatedPreDecimationTriangles = {
+    low: Math.max(conservativeFloor, Math.round(heuristicPre * 0.78)),
+    high: Math.max(conservativeFloor, Math.round(heuristicPre * 1.35)),
+  };
+
+  // Decimation target is maxTriangles, but outputs can vary a bit by topology.
+  const estimatedPostDecimationTriangles = {
+    low: Math.min(estimatedPreDecimationTriangles.low, maxTriangles),
+    high: Math.min(estimatedPreDecimationTriangles.high, Math.round(maxTriangles * 1.08)),
+  };
+
+  // Peak memory estimate from likely export-time attribute buffers.
+  const attr = currentGeometry.attributes;
+  let bytesPerVertex = (3 + 3) * 4; // position + normal (float32)
+  if (attr.uv) bytesPerVertex += 2 * 4;
+  if (attr.weights || attr.skinWeight) bytesPerVertex += 4 * 4;
+
+  // Exclusion weight is handled per-triangle in export path.
+  const hasExclusionWeights = excludedFaces && excludedFaces.size > 0;
+  const bytesPerTriangle = bytesPerVertex * 3 + (hasExclusionWeights ? 4 : 0);
+  const overheadMultiplier = { low: 2.2, high: 3.4 };
+  const estimatedPeakMemoryMB = {
+    low: (estimatedPreDecimationTriangles.low * bytesPerTriangle * overheadMultiplier.low) / (1024 * 1024),
+    high: (estimatedPreDecimationTriangles.high * bytesPerTriangle * overheadMultiplier.high) / (1024 * 1024),
+  };
+
+  return {
+    triangleCount,
+    estimatedPreDecimationTriangles,
+    estimatedPostDecimationTriangles,
+    estimatedPeakMemoryMB,
+  };
+}
+
+function collectExportValidation() {
+  const warnings = [];
+  const errors = [];
+
+  if (!currentGeometry?.attributes?.position) {
+    return { warnings, errors, estimate: null };
+  }
+
+  const triCount = currentGeometry.attributes.position.count / 3;
+
+  if (lastFastDiag?.nonManifoldEdges > 0) {
+    errors.push(t('diag.nonManifoldEdges', { n: lastFastDiag.nonManifoldEdges }));
+  }
+  if (lastAdvancedDiag?.intersectingPairs > 0) {
+    errors.push(t('diag.intersectingTris', { n: lastAdvancedDiag.intersectingPairs }));
+  }
+  if (lastFastDiag?.openEdges > 0) {
+    warnings.push(t('diag.openEdges', { n: lastFastDiag.openEdges }));
+  }
+  if (lastFastDiag?.shellCount > 1) {
+    warnings.push(t('diag.multipleShells', { n: lastFastDiag.shellCount }));
+  }
+  if (lastAdvancedDiag?.overlappingPairs > 0) {
+    warnings.push(t('diag.overlappingTris', { n: lastAdvancedDiag.overlappingPairs }));
+  }
+  if (triCount > settings.maxTriangles) {
+    warnings.push(t('warnings.safetyCapHit'));
+  }
+
+  return {
+    warnings,
+    errors,
+    estimate: _estimateExportRanges(),
+  };
+}
+
+function renderExportValidation() {
+  const validation = collectExportValidation();
+  if (!exportValidationEl) return validation;
+
+  const hasMessages = validation.errors.length > 0 || validation.warnings.length > 0 || !!validation.estimate;
+  exportValidationEl.classList.toggle('hidden', !hasMessages);
+  exportValidationEl.classList.toggle('has-errors', validation.errors.length > 0);
+  exportValidationEl.classList.toggle('has-warnings', validation.warnings.length > 0);
+
+  const lines = [];
+  if (validation.estimate) {
+    const est = validation.estimate;
+    const estimateText = [
+      `~${_formatEstimateRange(est.estimatedPreDecimationTriangles)} tris pre-decimation`,
+      `${_formatEstimateRange(est.estimatedPostDecimationTriangles)} post`,
+      `${_formatEstimateRange(est.estimatedPeakMemoryMB, { maximumFractionDigits: 1, minimumFractionDigits: 1 })} MB peak`,
+    ].join(' · ');
+    lines.push(`<div class="estimate-line">≈ ${estimateText}</div>`);
+  }
+
+  for (const msg of validation.errors) lines.push(`⛔ ${msg}`);
+  for (const msg of validation.warnings) lines.push(`⚠ ${msg}`);
+
+  if (!lines.length) {
+    exportValidationEl.classList.add('hidden');
+    exportValidationEl.innerHTML = '';
+  } else {
+    exportValidationEl.innerHTML = lines.join('<br/>');
+  }
+
+  return validation;
+}
+
 function checkResolutionWarning() {
   if (!currentBounds) return;
   const diag = Math.sqrt(
