@@ -602,6 +602,43 @@ main {
   border-color: var(--accent);
 }
 
+.beginner-mode-row {
+  margin-top: 10px;
+  margin-bottom: 0;
+}
+
+.beginner-mode-row .checkbox-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.advanced-control-group {
+  overflow: hidden;
+  transform-origin: top;
+  opacity: 1;
+  max-height: 200px;
+  transition: max-height 220ms ease, opacity 180ms ease, transform 180ms ease, margin 180ms ease;
+}
+
+.advanced-control-group.collapsed-advanced-control {
+  max-height: 0 !important;
+  opacity: 0;
+  transform: translateY(-4px);
+  margin-top: 0 !important;
+  margin-bottom: 0 !important;
+  pointer-events: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .advanced-control-group {
+    transition: none;
+  }
+}
+
 /* ── Sliders ─────────────────────────────────────────────────────────── */
 .slider-row { align-items: center; }
 
@@ -982,6 +1019,32 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 }
 
 .mesh-diag-spinner.hidden { display: none; }
+
+.mesh-diag-analysis {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+}
+
+.mesh-diag-analysis-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+  margin-bottom: 4px;
+}
+
+.mesh-diag-analysis-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.mesh-diag-analysis-item + .mesh-diag-analysis-item {
+  margin-top: 3px;
+}
 
 @keyframes diag-spin { to { transform: rotate(360deg); } }
 

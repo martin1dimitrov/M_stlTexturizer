@@ -932,10 +932,11 @@ export function setDiagEdges(positions, color = 0xff0000) {
  * @param {number}               color       – hex colour
  * @param {number}               [opacity=0.6]
  */
-export function addDiagFaces(overlayGeo, color, opacity = 0.6, xray = false) {
+export function addDiagFaces(overlayGeo, color, opacity = 0.6, xray = false, useVertexColors = false) {
   if (!overlayGeo || overlayGeo.attributes.position.count === 0) return;
   const mat = new THREE.MeshBasicMaterial({
-    color,
+    color: useVertexColors ? 0xffffff : color,
+    vertexColors: useVertexColors,
     side: THREE.DoubleSide,
     transparent: true,
     opacity,
