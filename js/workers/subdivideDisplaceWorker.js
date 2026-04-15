@@ -149,6 +149,7 @@ self.onmessage = async (e) => {
         decimationFailed,
         position: outPos,
         normal: outNrm,
+        vaseMetrics: displaced.userData?.vaseMetrics || null,
       },
       [outPos.buffer, outNrm.buffer]
     );

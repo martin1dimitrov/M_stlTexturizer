@@ -19,6 +19,7 @@ import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions, getShellAssignments } from './meshValidation.js';
 import { computeUV } from './mapping.js';
 import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
+import { computeUV } from './mapping.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -86,6 +87,9 @@ const settings = {
   symmetricDisplacement: false,
   useDisplacement: false,
   vaseModeSafe: false,
+  vaseSeamContinuityBias: 0.35,
+  vaseCircumferentialAttenuation: 0.65,
+  vaseRadialGuardMm: 0.05,
 };
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
@@ -259,6 +263,7 @@ const boundaryFalloffSlider    = document.getElementById('boundary-falloff');
 const boundaryFalloffVal       = document.getElementById('boundary-falloff-val');
 const symmetricDispToggle    = document.getElementById('symmetric-displacement');
 const dispPreviewToggle      = document.getElementById('displacement-preview');
+if (vaseModeSafeToggle) vaseModeSafeToggle.checked = settings.vaseModeSafe;
 
 // ── Exclusion panel DOM refs ──────────────────────────────────────────────────
 const exclBrushBtn        = document.getElementById('excl-brush-btn');
@@ -572,6 +577,7 @@ function resetTextureSmoothing() {
   settings.textureSmoothing = 0;
   textureSmoothingSlider.value = 0;
   textureSmoothingVal.value    = 0;
+  vaseValidationCache = { key: '', metrics: null };
 }
 
 function _quantileFromHist(hist, q, total) {
@@ -907,6 +913,13 @@ function wireEvents() {
     settings.symmetricDisplacement = symmetricDispToggle.checked;
     updatePreview();
   });
+  if (vaseModeSafeToggle) {
+    vaseModeSafeToggle.addEventListener('change', () => {
+      settings.vaseModeSafe = vaseModeSafeToggle.checked;
+      renderExportValidation();
+      updatePreview();
+    });
+  }
 
   dispPreviewToggle.addEventListener('change', () => {
     toggleDisplacementPreview(dispPreviewToggle.checked);
@@ -1933,6 +1946,8 @@ function addFineWheelSupport(input, applyFn) {
 function applyExportPreset(presetKey) {
   const preset = EXPORT_PRESETS[presetKey];
   if (!preset) return;
+  settings.vaseModeSafe = presetKey === 'vase';
+  if (vaseModeSafeToggle) vaseModeSafeToggle.checked = settings.vaseModeSafe;
   settings.refineLength = preset.refineLength;
   settings.maxTriangles = preset.maxTriangles;
   refineLenSlider.value = preset.refineLength;
@@ -1940,6 +1955,7 @@ function applyExportPreset(presetKey) {
   maxTriSlider.value = preset.maxTriangles;
   maxTriVal.textContent = formatM(preset.maxTriangles);
   checkResolutionWarning();
+  renderExportValidation();
   clearTimeout(previewDebounce);
   previewDebounce = setTimeout(updatePreview, 80);
 }
@@ -2009,6 +2025,8 @@ function loadDefaultCube() {
   currentGeometry = geo;
   currentBounds   = computeBounds(geo);
   currentStlName  = 'cube_50x50x50';
+  lastVaseMetrics = null;
+  vaseValidationCache = { key: '', metrics: null };
   checkAmplitudeWarning();
 
   loadGeometry(geo);
@@ -2079,6 +2097,8 @@ async function handleModelFile(file) {
     currentGeometry = geometry;
     currentBounds   = bounds;
     currentStlName  = file.name.replace(/\.(stl|obj|3mf)$/i, '');
+    lastVaseMetrics = null;
+    vaseValidationCache = { key: '', metrics: null };
     checkAmplitudeWarning();
 
     // Log (but don't block the user with an alert) if bad triangles were
@@ -2562,6 +2582,89 @@ function _estimateExportRanges() {
   };
 }
 
+function _sampleGray(imageData, w, h, u, v) {
+  u = ((u % 1) + 1) % 1;
+  v = ((v % 1) + 1) % 1;
+  v = 1 - v;
+  const fx = u * (w - 1), fy = v * (h - 1);
+  const x0 = Math.floor(fx), y0 = Math.floor(fy);
+  const x1 = Math.min(x0 + 1, w - 1), y1 = Math.min(y0 + 1, h - 1);
+  const tx = fx - x0, ty = fy - y0;
+  const d = imageData.data;
+  const v00 = d[(y0 * w + x0) * 4] / 255;
+  const v10 = d[(y0 * w + x1) * 4] / 255;
+  const v01 = d[(y1 * w + x0) * 4] / 255;
+  const v11 = d[(y1 * w + x1) * 4] / 255;
+  return v00 * (1 - tx) * (1 - ty) + v10 * tx * (1 - ty) + v01 * (1 - tx) * ty + v11 * tx * ty;
+}
+
+function _estimateVaseMetrics() {
+  if (!settings.vaseModeSafe || settings.mappingMode !== 3 || !currentGeometry?.attributes?.position || !activeMapEntry?.imageData) {
+    return null;
+  }
+  const geom = currentGeometry;
+  const pos = geom.attributes.position;
+  const nrm = geom.attributes.normal;
+  const key = [
+    geom.uuid, activeMapEntry.name, activeMapEntry.width, activeMapEntry.height,
+    settings.scaleU, settings.scaleV, settings.offsetU, settings.offsetV,
+    settings.rotation, settings.amplitude, settings.mappingBlend, settings.seamBandWidth,
+    settings.vaseSeamContinuityBias, settings.vaseCircumferentialAttenuation, settings.vaseRadialGuardMm,
+  ].join('|');
+  if (vaseValidationCache.key === key) return vaseValidationCache.metrics;
+
+  const bounds = currentBounds;
+  const step = Math.max(1, Math.floor(pos.count / 1200));
+  let seamZoneCount = 0;
+  let hfAcc = 0;
+  let hfAttAcc = 0;
+  let inwardRiskCount = 0;
+  let maxInwardRisk = 0;
+  let samples = 0;
+  const du = 1 / Math.max(64, activeMapEntry.width);
+
+  for (let i = 0; i < pos.count; i += step) {
+    const p = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i));
+    const n = new THREE.Vector3(nrm.getX(i), nrm.getY(i), nrm.getZ(i));
+    const uv = computeUV(p, n, settings.mappingMode, settings, bounds);
+    const chosen = uv.triplanar ? uv.samples.reduce((a, b) => (a.w > b.w ? a : b)) : uv;
+    const u = chosen.u;
+    const v = chosen.v;
+    const base = _sampleGray(activeMapEntry.imageData, activeMapEntry.width, activeMapEntry.height, u, v);
+    const gL = _sampleGray(activeMapEntry.imageData, activeMapEntry.width, activeMapEntry.height, u - du, v);
+    const gR = _sampleGray(activeMapEntry.imageData, activeMapEntry.width, activeMapEntry.height, u + du, v);
+    const hf = Math.abs(gL - 2 * base + gR);
+    const hfGain = Math.min(1, hf * 8);
+    hfAcc += hf;
+    hfAttAcc += hf * (1 - settings.vaseCircumferentialAttenuation * hfGain);
+
+    const centeredGrey = settings.symmetricDisplacement ? (base - 0.5) : base;
+    const disp = centeredGrey * settings.amplitude;
+    const rx = p.x - bounds.center.x;
+    const ry = p.y - bounds.center.y;
+    const radialLen = Math.hypot(rx, ry) || 1;
+    const inwardDot = -((rx / radialLen) * n.x + (ry / radialLen) * n.y);
+    const inwardMm = Math.max(0, disp * inwardDot);
+    maxInwardRisk = Math.max(maxInwardRisk, inwardMm);
+    if (inwardMm > settings.vaseRadialGuardMm) inwardRiskCount++;
+
+    const seamDist = Math.min(u, 1 - u);
+    const seamBand = (settings.seamBandWidth ?? 0.5) * 0.1;
+    if (seamBand > 1e-4 && seamDist < seamBand) seamZoneCount++;
+    samples++;
+  }
+
+  const metrics = {
+    seamZoneRatio: samples > 0 ? seamZoneCount / samples : 0,
+    circumferentialHFMean: samples > 0 ? hfAcc / samples : 0,
+    attenuatedHFMean: samples > 0 ? hfAttAcc / samples : 0,
+    radialReversalRiskCount: inwardRiskCount,
+    maxInwardRiskMm: maxInwardRisk,
+  };
+  vaseValidationCache = { key, metrics };
+  return metrics;
+}
+
 function collectExportValidation() {
   const warnings = [];
   const errors = [];
@@ -2589,6 +2692,33 @@ function collectExportValidation() {
   }
   if (triCount > settings.maxTriangles) {
     warnings.push(t('warnings.safetyCapHit'));
+  }
+
+  if (settings.vaseModeSafe) {
+    if (settings.mappingMode !== 3) {
+      errors.push('Vase Workflow Safeguards require Cylindrical mapping. Set Projection → Cylindrical for Spiral Vase exports.');
+    }
+    const vaseMetrics = lastVaseMetrics || _estimateVaseMetrics();
+    if (!vaseMetrics) {
+      errors.push('Vase validation could not run. Load a displacement map and keep Cylindrical mapping enabled for Spiral Vase compatibility checks.');
+    } else {
+      const seamRisk = (vaseMetrics.seamBlendSamples > 0)
+        ? Math.abs(0.5 - vaseMetrics.seamBlendMixMean)
+        : vaseMetrics.seamZoneRatio;
+      const hfMetric = vaseMetrics.attenuatedHFMean ?? vaseMetrics.circumferentialHFMean;
+      const radialRiskCount = vaseMetrics.radialReversalRiskCount ?? vaseMetrics.radialReversalCorrections ?? 0;
+      const radialRiskMm = vaseMetrics.maxInwardRiskMm ?? vaseMetrics.maxRadialInwardMm ?? 0;
+
+      if (seamRisk > 0.22) {
+        errors.push('Spiral Vase seam continuity is unsafe. Reduce Transition Smoothing or lower texture Scale U to keep the seam band continuous.');
+      }
+      if (hfMetric > 0.055) {
+        errors.push('Circumferential detail is too high-frequency for reliable Spiral Vase walls. Increase texture smoothing or use a softer map.');
+      }
+      if (radialRiskCount > 0 || radialRiskMm > settings.vaseRadialGuardMm + 1e-4) {
+        errors.push(`Radial reversal risk detected (${radialRiskCount} bands, max ${radialRiskMm.toFixed(3)} mm inward). Reduce amplitude or enable symmetric displacement for Spiral Vase.`);
+      }
+    }
   }
 
   return {
@@ -3942,6 +4072,7 @@ async function handleExport(format = 'stl') {
     if (exportToken !== myToken) return;
 
     const dispTriCount = displaced.attributes.position.count / 3;
+    lastVaseMetrics = displaced.userData?.vaseMetrics || null;
     const needsDecimation = dispTriCount > settings.maxTriangles;
     triLimitWarning.classList.toggle('hidden', !safetyCapHit);
     triLimitWarning.textContent = t('warnings.safetyCapHit');
