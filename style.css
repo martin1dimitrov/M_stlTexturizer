@@ -792,6 +792,11 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
   background: var(--surface2);
   color: var(--text-muted);
 }
+.export-validation .estimate-line {
+  font-weight: 600;
+  opacity: 0.95;
+  margin-bottom: 3px;
+}
 
 .export-validation.hidden { display: none; }
 .export-validation.has-errors {
