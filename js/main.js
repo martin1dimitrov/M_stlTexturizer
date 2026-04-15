@@ -55,6 +55,7 @@ let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
 let exportWorker          = null;
+const EXPORT_STAGE_DEBUG = /\bexportStageDebug=1\b/.test(window.location.search);
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
 let _spatialGrid = null;
@@ -62,6 +63,7 @@ let _spatialCellSize = 0;
 let _spatialMinX = 0, _spatialMinY = 0, _spatialMinZ = 0;
 
 const settings = {
+  beginnerMode:  true,
   mappingMode:   5,     // Triplanar default
   scaleU:        0.5,
   scaleV:        0.5,
@@ -212,6 +214,7 @@ const triLimitWarning  = document.getElementById('tri-limit-warning');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
+const beginnerModeToggle = document.getElementById('beginner-mode-toggle');
 
 const mappingSelect   = document.getElementById('mapping-mode');
 const scaleUSlider    = document.getElementById('scale-u');
@@ -287,8 +290,7 @@ const meshDiagFast       = document.getElementById('mesh-diag-fast');
 const meshDiagRunBtn     = document.getElementById('mesh-diag-run-btn');
 const meshDiagSpinner    = document.getElementById('mesh-diag-spinner');
 const meshDiagAdvanced   = document.getElementById('mesh-diag-advanced');
-const diagSignedDispToggle = document.getElementById('diag-overlay-signed-disp');
-const diagTriDensityToggle = document.getElementById('diag-overlay-tri-density');
+const advancedControlGroups = Array.from(document.querySelectorAll('.advanced-control-group'));
 
 // ── License panel DOM refs ────────────────────────────────────────────────────
 const licenseLink    = document.getElementById('license-link');
@@ -308,6 +310,97 @@ const _LOG_MIN = Math.log(0.05);
 const _LOG_MAX = Math.log(10);
 const scaleToPos = v => Math.round(Math.max(0, Math.min(1000, (Math.log(Math.max(0.01, Math.min(10, v))) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000)));
 const posToScale = p => parseFloat(Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - _LOG_MIN)).toFixed(2));
+let advancedSettingSnapshot = null;
+
+function setLinkedControl(slider, valInput, value, formatter = null) {
+  if (!slider || !valInput) return;
+  slider.value = value;
+  if (valInput.tagName === 'SPAN') {
+    valInput.textContent = formatter ? formatter(value) : value;
+  } else {
+    valInput.value = formatter ? formatter(value) : value;
+  }
+}
+
+function captureAdvancedSettings() {
+  advancedSettingSnapshot = {
+    mappingBlend: settings.mappingBlend,
+    seamBandWidth: settings.seamBandWidth,
+    capAngle: settings.capAngle,
+    offsetU: settings.offsetU,
+    offsetV: settings.offsetV,
+    rotation: settings.rotation,
+    useDisplacement: settings.useDisplacement,
+    precisionMaskingEnabled,
+  };
+}
+
+function restoreAdvancedSettings() {
+  if (!advancedSettingSnapshot) return;
+  settings.mappingBlend = advancedSettingSnapshot.mappingBlend;
+  settings.seamBandWidth = advancedSettingSnapshot.seamBandWidth;
+  settings.capAngle = advancedSettingSnapshot.capAngle;
+  settings.offsetU = advancedSettingSnapshot.offsetU;
+  settings.offsetV = advancedSettingSnapshot.offsetV;
+  settings.rotation = advancedSettingSnapshot.rotation;
+
+  setLinkedControl(seamBlendSlider, seamBlendVal, settings.mappingBlend, v => Number(v).toFixed(2));
+  setLinkedControl(seamBandWidthSlider, seamBandWidthVal, settings.seamBandWidth, v => Number(v).toFixed(2));
+  setLinkedControl(capAngleSlider, capAngleVal, settings.capAngle, v => Math.round(Number(v)));
+  setLinkedControl(offsetUSlider, offsetUVal, settings.offsetU, v => Number(v).toFixed(2));
+  setLinkedControl(offsetVSlider, offsetVVal, settings.offsetV, v => Number(v).toFixed(2));
+  setLinkedControl(rotationSlider, rotationVal, settings.rotation, v => Math.round(Number(v)));
+
+  if (advancedSettingSnapshot.useDisplacement) {
+    dispPreviewToggle.checked = true;
+    toggleDisplacementPreview(true);
+  }
+  if (advancedSettingSnapshot.precisionMaskingEnabled && !precisionMaskingRow.classList.contains('hidden')) {
+    precisionMaskingToggle.checked = true;
+    togglePrecisionMasking(true);
+  }
+}
+
+function applyBeginnerModeUI() {
+  const beginnerMode = !!settings.beginnerMode;
+  document.body.classList.toggle('beginner-mode', beginnerMode);
+  advancedControlGroups.forEach(group => {
+    group.classList.toggle('collapsed-advanced-control', beginnerMode);
+    if (beginnerMode) group.setAttribute('aria-hidden', 'true');
+    else group.removeAttribute('aria-hidden');
+  });
+
+  if (beginnerMode) {
+    if (!advancedSettingSnapshot) captureAdvancedSettings();
+    settings.mappingBlend = 1;
+    settings.seamBandWidth = 0.35;
+    settings.capAngle = 20;
+    settings.offsetU = 0;
+    settings.offsetV = 0;
+    settings.rotation = 0;
+
+    setLinkedControl(seamBlendSlider, seamBlendVal, 1, () => '1.00');
+    setLinkedControl(seamBandWidthSlider, seamBandWidthVal, 0.35, () => '0.35');
+    setLinkedControl(capAngleSlider, capAngleVal, 20, () => 20);
+    setLinkedControl(offsetUSlider, offsetUVal, 0, () => '0.00');
+    setLinkedControl(offsetVSlider, offsetVVal, 0, () => '0.00');
+    setLinkedControl(rotationSlider, rotationVal, 0, () => 0);
+
+    if (dispPreviewToggle.checked || settings.useDisplacement) {
+      dispPreviewToggle.checked = false;
+      toggleDisplacementPreview(false);
+    }
+    if (precisionMaskingEnabled) {
+      precisionMaskingToggle.checked = false;
+      togglePrecisionMasking(false);
+    }
+  } else {
+    restoreAdvancedSettings();
+    advancedSettingSnapshot = null;
+  }
+  checkResolutionWarning();
+  updatePreview();
+}
 
 function _applyScaleU(v) {
   v = Math.max(0.01, Math.min(10, v));
@@ -326,6 +419,11 @@ initViewer(canvas);
 
 // Apply saved theme to 3D viewport on startup
 setViewerTheme(document.documentElement.getAttribute('data-theme') === 'light');
+
+const beginnerModeKey = 'stlt-beginner-mode';
+const savedBeginnerMode = localStorage.getItem(beginnerModeKey);
+settings.beginnerMode = savedBeginnerMode === null ? true : savedBeginnerMode !== '0';
+if (beginnerModeToggle) beginnerModeToggle.checked = settings.beginnerMode;
 
 // Populate the language selector
 function populateLanguageSelector() {
@@ -740,6 +838,12 @@ function wireEvents() {
   });
 
   // ── Settings ──
+  beginnerModeToggle?.addEventListener('change', () => {
+    settings.beginnerMode = beginnerModeToggle.checked;
+    localStorage.setItem(beginnerModeKey, settings.beginnerMode ? '1' : '0');
+    applyBeginnerModeUI();
+  });
+
   mappingSelect.addEventListener('change', () => {
     settings.mappingMode = parseInt(mappingSelect.value, 10);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
@@ -892,6 +996,7 @@ function wireEvents() {
 
   // ── Projection toggle ──
   projectionToggle.addEventListener('change', () => setProjection(projectionToggle.checked));
+  applyBeginnerModeUI();
 
   // ── Exclusion tool wiring ─────────────────────────────────────────────────
 
@@ -3653,6 +3758,7 @@ async function handleExport(format = 'stl') {
   let displaced       = null;
   let finalGeometry   = null;
   let exportSucceeded = false; // set true only after exportSTL so finally can clean up on abort/error
+  const stageStats = { maxObservedMB: 0 };
 
   try {
     setProgress(0.02, t('progress.subdividing'));
@@ -3670,8 +3776,10 @@ async function handleExport(format = 'stl') {
 
     const exportEntry = getEffectiveMapEntry();
     let safetyCapHit = false;
+    let workerDecimationFailed = false;
     try {
-      ({ geometry: displaced, safetyCapHit } = await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed } =
+        await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
     } catch (workerErr) {
       console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
       ({ geometry: subdivided, safetyCapHit } = await subdivide(
@@ -3702,8 +3810,10 @@ async function handleExport(format = 'stl') {
       );
       if (exportToken !== myToken) return;
 
-      // Free subdivided geometry — displacement created a separate copy
-      subdivided.dispose();
+      // Free subdivided geometry immediately after handoff to displacement stage.
+      releaseGeometryBuffers(subdivided, 'subdivision->displacement');
+      subdivided = null;
+      observeExportStage('displacement', displaced, stageStats);
     }
     if (exportToken !== myToken) return;
 
@@ -3714,6 +3824,9 @@ async function handleExport(format = 'stl') {
 
     finalGeometry = displaced;
     if (needsDecimation) {
+      if (workerDecimationFailed) {
+        console.warn('Worker decimation failed, running main-thread decimation fallback.');
+      }
       setProgress(0.71, t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
       finalGeometry = await runAsync(() =>
         decimate(
@@ -3728,9 +3841,13 @@ async function handleExport(format = 'stl') {
           }
         )
       );
-      // Free pre-decimation geometry — decimate created a separate copy
-      displaced.dispose();
+      observeExportStage('decimation', finalGeometry, stageStats);
+      // Free pre-decimation geometry immediately after handoff to decimation output.
+      releaseGeometryBuffers(displaced, 'displacement->decimation');
+      displaced = null;
 	  if (exportToken !== myToken) return;
+    } else {
+      observeExportStage('decimation-skipped', finalGeometry, stageStats);
     }
 
     // Flat-bottom clamp: when bottom faces are masked (bottomAngleLimit > 0),
@@ -3771,16 +3888,33 @@ async function handleExport(format = 'stl') {
       setProgress(0.97, t('progress.writing3mf'));
       await yieldFrame();
       if (exportToken !== myToken) return;
+      observeExportStage('write-3mf', finalGeometry, stageStats);
       export3MF(finalGeometry, `${baseName}.3mf`);
     } else {
       setProgress(0.97, t('progress.writingStl'));
       await yieldFrame();
       if (exportToken !== myToken) return;
+      observeExportStage('write-stl', finalGeometry, stageStats);
       exportSTL(finalGeometry, `${baseName}.stl`);
     }
+    releaseGeometryBuffers(finalGeometry, 'write-complete');
+    finalGeometry = null;
     exportSucceeded = true;
 
-    setProgress(1.0, t('progress.done'));
+    const doneLabel = EXPORT_STAGE_DEBUG && stageStats.maxObservedMB > 0
+      ? `${t('progress.done')} · max ~${stageStats.maxObservedMB.toFixed(1)} MB`
+      : t('progress.done');
+    setProgress(1.0, doneLabel);
+    if (EXPORT_STAGE_DEBUG && stageStats.maxObservedMB > 0) {
+      console.info(
+        `[export][summary] max-observed-buffer-estimate=${stageStats.maxObservedMB.toFixed(2)} MB`
+      );
+      if (stageStats.maxObservedMB > 512) {
+        console.warn(
+          `[export][warning] high peak stage estimate (${stageStats.maxObservedMB.toFixed(2)} MB)`
+        );
+      }
+    }
     setTimeout(() => {
       exportProgress.classList.add('hidden');
       setProgress(0, '');
@@ -3795,9 +3929,11 @@ async function handleExport(format = 'stl') {
   } finally {
     // Dispose all intermediate geometries regardless of success, failure, or abort.
     // finalGeometry may alias displaced (no decimation) — avoid double-dispose.
-    if (subdivided) subdivided.dispose();
-    if (displaced && displaced !== subdivided) displaced.dispose();
-    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) finalGeometry.dispose();
+    if (subdivided) releaseGeometryBuffers(subdivided, 'finally-subdivided');
+    if (displaced && displaced !== subdivided) releaseGeometryBuffers(displaced, 'finally-displaced');
+    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) {
+      releaseGeometryBuffers(finalGeometry, 'finally-final');
+    }
     // Hide progress immediately on error or stale abort; success hides it after 1500 ms.
     if (!exportSucceeded) exportProgress.classList.add('hidden');
     isExporting = false;
@@ -3811,6 +3947,41 @@ function setProgress(fraction, label) {
   exportProgBar.style.width = `${pct}%`;
   exportProgPct.textContent = `${pct}%`;
   exportProgLbl.textContent = label;
+}
+
+function estimateGeometryBufferMB(geo) {
+  if (!geo?.attributes) return 0;
+  let bytes = 0;
+  for (const attr of Object.values(geo.attributes)) {
+    if (attr?.array?.byteLength) bytes += attr.array.byteLength;
+  }
+  if (geo.index?.array?.byteLength) bytes += geo.index.array.byteLength;
+  return bytes / (1024 * 1024);
+}
+
+function observeExportStage(stageName, geo, stageStats) {
+  if (!geo?.attributes?.position) return;
+  const triCount = geo.attributes.position.count / 3;
+  const estimateMB = estimateGeometryBufferMB(geo);
+  if (stageStats && estimateMB > stageStats.maxObservedMB) stageStats.maxObservedMB = estimateMB;
+  if (EXPORT_STAGE_DEBUG) {
+    console.info(
+      `[export][stage] ${stageName} | tris=${triCount.toLocaleString()} | buffers~${estimateMB.toFixed(2)} MB`
+    );
+  }
+}
+
+function releaseGeometryBuffers(geo, label = '') {
+  if (!geo) return;
+  if (EXPORT_STAGE_DEBUG) {
+    const mb = estimateGeometryBufferMB(geo);
+    console.info(`[export][release] ${label || 'geometry'} | buffers~${mb.toFixed(2)} MB`);
+  }
+  if (geo.attributes) {
+    for (const name of Object.keys(geo.attributes)) geo.deleteAttribute(name);
+  }
+  geo.setIndex(null);
+  geo.dispose();
 }
 
 /**
@@ -3863,7 +4034,10 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
       height: exportEntry.height,
     },
     refineLength: settings.refineLength,
+    maxTriangles: settings.maxTriangles,
+    decimationOptions: {},
     settings: { ...settings },
+    debugStageStats: EXPORT_STAGE_DEBUG,
     bounds: {
       min: { x: currentBounds.min.x, y: currentBounds.min.y, z: currentBounds.min.z },
       max: { x: currentBounds.max.x, y: currentBounds.max.y, z: currentBounds.max.z },
@@ -3889,6 +4063,23 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
           setProgress(0.02 + (data.fraction ?? 0) * 0.35, label);
         } else if (data.phase === 'displace') {
           setProgress(0.38 + (data.fraction ?? 0) * 0.32, t('progress.displacingVertices'));
+        } else if (data.phase === 'decimate') {
+          const triCount = data.triCount ?? 0;
+          const target = data.targetTriangles ?? settings.maxTriangles;
+          if (data.failed) {
+            setProgress(0.96, t('progress.decimatingTo', {
+              from: triCount.toLocaleString(),
+              to: target.toLocaleString(),
+            }));
+          } else {
+            setProgress(
+              0.71 + (data.fraction ?? 0) * 0.25,
+              t('progress.decimating', {
+                cur: triCount.toLocaleString(),
+                to: target.toLocaleString(),
+              })
+            );
+          }
         }
         return;
       }
@@ -3897,7 +4088,11 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
         geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
-        resolve({ geometry: geo, safetyCapHit: !!data.safetyCapHit });
+        resolve({
+          geometry: geo,
+          safetyCapHit: !!data.safetyCapHit,
+          decimationFailed: !!data.decimationFailed,
+        });
         return;
       }
       if (data.type === 'error') {
