@@ -64,6 +64,7 @@ self.onmessage = async (e) => {
         safetyCapHit: subdivResult.safetyCapHit,
         position: outPos,
         normal: outNrm,
+        vaseMetrics: displaced.userData?.vaseMetrics || null,
       },
       [outPos.buffer, outNrm.buffer]
     );

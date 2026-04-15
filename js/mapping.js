@@ -15,6 +15,15 @@ export const MODE_CUBIC       = 6;
 const TWO_PI = Math.PI * 2;
 const CUBIC_AXIS_EPSILON = 1e-4;
 
+function applyContinuityBias(t, bias = 0) {
+  const b = Math.max(0, Math.min(1, bias));
+  if (b <= 1e-4) return t;
+  // Pull seam blending slightly toward the nearer side instead of a pure 50/50.
+  // This reduces abrupt circumferential phase jumps on Spiral Vase walls.
+  const edgePref = t >= 0.5 ? 1 : -1;
+  return Math.max(0, Math.min(1, t + edgePref * b * 0.2));
+}
+
 export function getDominantCubicAxis(normal) {
   const ax = Math.abs(normal.x);
   const ay = Math.abs(normal.y);
@@ -162,7 +171,9 @@ export function computeUV(pos, normal, mode, settings, bounds) {
       if (inSeamZone) {
         const d = uRaw < 0.5 ? uRaw : uRaw - 1.0;
         const tRaw = (d + seamBand) / (2.0 * seamBand);
-        const t = tRaw * tRaw * (3 - 2 * tRaw); // smoothstep
+        const tSmooth = tRaw * tRaw * (3 - 2 * tRaw); // smoothstep
+        const bias = settings.vaseModeSafe ? (settings.vaseSeamContinuityBias ?? 0) : 0;
+        const t = applyContinuityBias(tSmooth, bias);
         const tLeft  = applyTransform(1.0 + d, vSide, scaleU, scaleV, offsetU, offsetV, cosR, sinR);
         const tRight = applyTransform(d,       vSide, scaleU, scaleV, offsetU, offsetV, cosR, sinR);
         sideSamples = [

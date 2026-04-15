@@ -103,6 +103,15 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   // Displacement cache: one sample per unique vertex (replaces dispCache Map)
   const dispCacheVal = new Float64Array(uniqueCount);
   const dispCacheSet = new Uint8Array(uniqueCount);
+  const vaseMode = settings.vaseModeSafe && settings.mappingMode === 3;
+  const vaseMetrics = {
+    seamBlendSamples: 0,
+    seamBlendMixMean: 0,
+    circumferentialHFMean: 0,
+    circumferentialAttenuationMean: 0,
+    radialReversalCorrections: 0,
+    maxRadialInwardMm: 0,
+  };
 
   for (let t = 0; t < count; t += 3) {
     vA.fromBufferAttribute(posAttr, t);
@@ -353,10 +362,32 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     if (uvResult.triplanar) {
       grey = 0;
       for (const s of uvResult.samples) {
-        grey += sampleBilinear(imageData.data, imgWidth, imgHeight, s.u, s.v) * s.w;
+        if (vaseMode) {
+          const sg = sampleCylinderGreyWithAttenuation(
+            imageData.data, imgWidth, imgHeight, s.u, s.v, settings.vaseCircumferentialAttenuation
+          );
+          grey += sg.grey * s.w;
+          vaseMetrics.circumferentialHFMean += sg.hfLocal;
+          vaseMetrics.circumferentialAttenuationMean += sg.attenuationDelta;
+          if (s.w < 0.999) {
+            vaseMetrics.seamBlendSamples++;
+            vaseMetrics.seamBlendMixMean += s.w;
+          }
+        } else {
+          grey += sampleBilinear(imageData.data, imgWidth, imgHeight, s.u, s.v) * s.w;
+        }
       }
     } else {
-      grey = sampleBilinear(imageData.data, imgWidth, imgHeight, uvResult.u, uvResult.v);
+      if (vaseMode) {
+        const sg = sampleCylinderGreyWithAttenuation(
+          imageData.data, imgWidth, imgHeight, uvResult.u, uvResult.v, settings.vaseCircumferentialAttenuation
+        );
+        grey = sg.grey;
+        vaseMetrics.circumferentialHFMean += sg.hfLocal;
+        vaseMetrics.circumferentialAttenuationMean += sg.attenuationDelta;
+      } else {
+        grey = sampleBilinear(imageData.data, imgWidth, imgHeight, uvResult.u, uvResult.v);
+      }
     }
     dispCacheVal[vid] = grey;
   }
@@ -390,6 +421,8 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
     const newX = tmpPos.x + smoothNrmX[vid] * disp;
     const newY = tmpPos.y + smoothNrmY[vid] * disp;
     let   newZ = tmpPos.z + smoothNrmZ[vid] * disp;
+    let correctedX = newX;
+    let correctedY = newY;
 
     // Prevent boundary vertices from poking through the masked surface in Z.
     // Only triggers for vertices that are partly masked (maskedFrac > 0) and
@@ -399,8 +432,26 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
       if (settings.topAngleLimit    > 0 && newZ > tmpPos.z) newZ = tmpPos.z;
     }
 
-    newPos[i*3]   = newX;
-    newPos[i*3+1] = newY;
+    if (vaseMode) {
+      const rx0 = tmpPos.x - bounds.center.x;
+      const ry0 = tmpPos.y - bounds.center.y;
+      const r0 = Math.hypot(rx0, ry0);
+      const rx1 = correctedX - bounds.center.x;
+      const ry1 = correctedY - bounds.center.y;
+      const r1 = Math.hypot(rx1, ry1);
+      const maxInward = Math.max(0, settings.vaseRadialGuardMm ?? 0.05);
+      const minR = Math.max(0, r0 - maxInward);
+      if (r1 < minR && r1 > 1e-9) {
+        const scl = minR / r1;
+        correctedX = bounds.center.x + rx1 * scl;
+        correctedY = bounds.center.y + ry1 * scl;
+        vaseMetrics.radialReversalCorrections++;
+        vaseMetrics.maxRadialInwardMm = Math.max(vaseMetrics.maxRadialInwardMm, r0 - r1);
+      }
+    }
+
+    newPos[i*3]   = correctedX;
+    newPos[i*3+1] = correctedY;
     newPos[i*3+2] = newZ;
 
     // Keep per-face normal for shading (recomputed below anyway)
@@ -435,6 +486,17 @@ export function applyDisplacement(geometry, imageData, imgWidth, imgHeight, sett
   const out = new THREE.BufferGeometry();
   out.setAttribute('position', new THREE.BufferAttribute(newPos, 3));
   out.setAttribute('normal',   new THREE.BufferAttribute(newNrm, 3));
+  if (vaseMode) {
+    const samples = Math.max(1, uniqueCount);
+    out.userData.vaseMetrics = {
+      seamBlendSamples: vaseMetrics.seamBlendSamples,
+      seamBlendMixMean: vaseMetrics.seamBlendSamples > 0 ? (vaseMetrics.seamBlendMixMean / vaseMetrics.seamBlendSamples) : 0,
+      circumferentialHFMean: vaseMetrics.circumferentialHFMean / samples,
+      circumferentialAttenuationMean: vaseMetrics.circumferentialAttenuationMean / samples,
+      radialReversalCorrections: vaseMetrics.radialReversalCorrections,
+      maxRadialInwardMm: vaseMetrics.maxRadialInwardMm,
+    };
+  }
   return out;
 }
 
@@ -471,6 +533,22 @@ function sampleBilinear(data, w, h, u, v) {
        + v10 * tx * (1-ty)
        + v01 * (1-tx) * ty
        + v11 * tx * ty;
+}
+
+function sampleCylinderGreyWithAttenuation(data, w, h, u, v, attenuation) {
+  const base = sampleBilinear(data, w, h, u, v);
+  const att = Math.max(0, Math.min(1, attenuation ?? 0));
+  if (att <= 1e-4) return { grey: base, attenuationDelta: 0, hfLocal: 0 };
+
+  const du = 1 / Math.max(64, w);
+  const gL = sampleBilinear(data, w, h, u - du, v);
+  const gR = sampleBilinear(data, w, h, u + du, v);
+  const hfLocal = Math.abs(gL - 2 * base + gR);
+  const mean = (gL + base + gR) / 3;
+  const hfGain = Math.min(1, hfLocal * 8);
+  const blend = att * hfGain;
+  const out = base * (1 - blend) + mean * blend;
+  return { grey: out, attenuationDelta: Math.abs(base - out), hfLocal };
 }
 
 /** Apply scale/offset/rotation to raw UV for cubic projection.
