@@ -582,90 +582,6 @@ function clearTextureValidation() {
   textureValidationEl.textContent = '';
 }
 
-function collectExportValidation() {
-  const errors = [];
-  const warnings = [];
-
-  if (!currentGeometry) errors.push('Load a model before exporting.');
-  if (!activeMapEntry) errors.push('Select or upload a displacement map before exporting.');
-
-  if (currentBounds) {
-    const minDim = Math.min(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
-    if (Math.abs(settings.amplitude) > minDim * 0.1) {
-      warnings.push('Amplitude is high relative to model size; self-intersections may occur.');
-    }
-    const diag = Math.sqrt(currentBounds.size.x ** 2 + currentBounds.size.y ** 2 + currentBounds.size.z ** 2);
-    if (settings.refineLength > diag / 100) {
-      warnings.push('Resolution is coarse for this model; fine texture detail may be lost.');
-    }
-  }
-
-  if (lastFastDiag) {
-    if (lastFastDiag.openEdges > 0) errors.push(`Mesh has ${lastFastDiag.openEdges.toLocaleString()} open edge(s).`);
-    if (lastFastDiag.nonManifoldEdges > 0) errors.push(`Mesh has ${lastFastDiag.nonManifoldEdges.toLocaleString()} non-manifold edge(s).`);
-    if (lastFastDiag.shellCount > 1) warnings.push(`Mesh contains ${lastFastDiag.shellCount.toLocaleString()} separate shells.`);
-  }
-  if (lastAdvancedDiag) {
-    if (lastAdvancedDiag.intersectingPairs > 0) errors.push(`Mesh has ${lastAdvancedDiag.intersectingPairs.toLocaleString()} intersecting triangle pair(s).`);
-    if (lastAdvancedDiag.overlappingPairs > 0) warnings.push(`Mesh has ${lastAdvancedDiag.overlappingPairs.toLocaleString()} overlapping triangle pair(s).`);
-  }
-
-  if (settings.maxTriangles < 150_000) {
-    warnings.push('Output triangle limit is low; visible faceting is likely.');
-  }
-
-  if (settings.vaseModeSafe) {
-    if (settings.mappingMode !== 3) {
-      warnings.push('Vase Mode Safety works best with Cylindrical projection.');
-    }
-    if (settings.amplitude < 0) {
-      errors.push('Negative amplitude is blocked in Vase Mode Safety to avoid inward contour reversals.');
-    }
-    if (currentBounds) {
-      const minDim = Math.min(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
-      if (Math.abs(settings.amplitude) > minDim * 0.05) {
-        errors.push('Amplitude exceeds 5% of the smallest model dimension in Vase Mode Safety.');
-      }
-    }
-    const v = activeMapEntry?._validation;
-    if (v?.metrics?.seamScore > 0.18) {
-      errors.push('Texture seam score is too high for Vase Mode Safety.');
-    } else if (v?.metrics?.seamScore > 0.10) {
-      warnings.push('Texture seam score is elevated; visible seam risk in vase prints.');
-    }
-  }
-
-  return { errors, warnings };
-}
-
-function renderExportValidation() {
-  if (!exportValidationEl) return { errors: [], warnings: [] };
-  const { errors, warnings } = collectExportValidation();
-  exportValidationEl.classList.remove('hidden', 'has-errors', 'has-warnings');
-
-  if (errors.length === 0 && warnings.length === 0) {
-    exportValidationEl.classList.add('hidden');
-    exportValidationEl.textContent = '';
-    return { errors, warnings };
-  }
-
-  if (errors.length) exportValidationEl.classList.add('has-errors');
-  else exportValidationEl.classList.add('has-warnings');
-
-  const lines = [];
-  if (errors.length) {
-    lines.push('<strong>Export blocked:</strong>');
-    for (const err of errors) lines.push(`• ${err}`);
-  }
-  if (warnings.length) {
-    if (errors.length) lines.push('<br/><strong>Warnings:</strong>');
-    else lines.push('<strong>Warnings:</strong>');
-    for (const warn of warnings) lines.push(`• ${warn}`);
-  }
-  exportValidationEl.innerHTML = lines.join('<br/>');
-  return { errors, warnings };
-}
-
 let _selectGeneration = 0;   // debounce rapid preset clicks
 
 async function selectPreset(idx, swatchEl) {
@@ -915,12 +831,6 @@ function wireEvents() {
   if (exportPresetSelect) {
     exportPresetSelect.addEventListener('change', () => {
       applyExportPreset(exportPresetSelect.value);
-    });
-  }
-  if (vaseModeSafeToggle) {
-    vaseModeSafeToggle.addEventListener('change', () => {
-      settings.vaseModeSafe = vaseModeSafeToggle.checked;
-      renderExportValidation();
     });
   }
 
@@ -1894,12 +1804,10 @@ function applyExportPreset(presetKey) {
   if (!preset) return;
   settings.refineLength = preset.refineLength;
   settings.maxTriangles = preset.maxTriangles;
-  settings.vaseModeSafe = presetKey === 'vase';
   refineLenSlider.value = preset.refineLength;
   refineLenVal.value = formatInputValue(refineLenVal, preset.refineLength);
   maxTriSlider.value = preset.maxTriangles;
   maxTriVal.textContent = formatM(preset.maxTriangles);
-  if (vaseModeSafeToggle) vaseModeSafeToggle.checked = settings.vaseModeSafe;
   checkResolutionWarning();
   clearTimeout(previewDebounce);
   previewDebounce = setTimeout(updatePreview, 80);
