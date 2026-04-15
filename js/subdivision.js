@@ -12,7 +12,7 @@
  * @returns {{ geometry: THREE.BufferGeometry, safetyCapHit: boolean }}
  */
 
-import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
+import * as THREE from 'three';
 
 const QUANTISE   = 1e4;
 const SAFETY_CAP = 20_000_000; // absolute OOM guard
