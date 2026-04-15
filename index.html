@@ -92,6 +92,18 @@
           <input type="checkbox" id="projection-toggle" />
           <span data-i18n="ui.perspective">Perspective View</span>
         </label>
+        <label class="wireframe-toggle">
+          <span>Overlay</span>
+          <select id="overlay-mode" class="overlay-select">
+            <option value="none" selected>None</option>
+            <option value="seam-risk">Seam Risk</option>
+            <option value="mask-stress">Mask Stress</option>
+          </select>
+        </label>
+        <label class="wireframe-toggle">
+          <input type="checkbox" id="split-view-toggle" />
+          <span>Split View</span>
+        </label>
 
         <div class="viewport-controls-hint" data-i18n="ui.controlsHint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
       </div>

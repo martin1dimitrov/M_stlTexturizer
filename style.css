@@ -315,13 +315,14 @@ main {
 }
 
 #viewport-footer {
-  height: 28px;
+  min-height: 28px;
   background: var(--surface);
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   padding: 0 12px;
-  gap: 16px;
+  gap: 8px 14px;
   flex-shrink: 0;
 }
 
@@ -345,6 +346,16 @@ main {
   color: var(--text-muted);
   cursor: pointer;
   user-select: none;
+}
+
+.overlay-select {
+  min-width: 120px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 2px 6px;
 }
 
 .place-on-face-btn {
