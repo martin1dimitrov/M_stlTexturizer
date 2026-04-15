@@ -61,6 +61,7 @@ let _spatialCellSize = 0;
 let _spatialMinX = 0, _spatialMinY = 0, _spatialMinZ = 0;
 
 const settings = {
+  beginnerMode:  true,
   mappingMode:   5,     // Triplanar default
   scaleU:        0.5,
   scaleV:        0.5,
@@ -207,6 +208,7 @@ const triLimitWarning  = document.getElementById('tri-limit-warning');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
+const beginnerModeToggle = document.getElementById('beginner-mode-toggle');
 
 const mappingSelect   = document.getElementById('mapping-mode');
 const scaleUSlider    = document.getElementById('scale-u');
@@ -282,6 +284,7 @@ const meshDiagFast       = document.getElementById('mesh-diag-fast');
 const meshDiagRunBtn     = document.getElementById('mesh-diag-run-btn');
 const meshDiagSpinner    = document.getElementById('mesh-diag-spinner');
 const meshDiagAdvanced   = document.getElementById('mesh-diag-advanced');
+const advancedControlGroups = Array.from(document.querySelectorAll('.advanced-control-group'));
 
 // ── License panel DOM refs ────────────────────────────────────────────────────
 const licenseLink    = document.getElementById('license-link');
@@ -301,6 +304,97 @@ const _LOG_MIN = Math.log(0.05);
 const _LOG_MAX = Math.log(10);
 const scaleToPos = v => Math.round(Math.max(0, Math.min(1000, (Math.log(Math.max(0.01, Math.min(10, v))) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000)));
 const posToScale = p => parseFloat(Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - _LOG_MIN)).toFixed(2));
+let advancedSettingSnapshot = null;
+
+function setLinkedControl(slider, valInput, value, formatter = null) {
+  if (!slider || !valInput) return;
+  slider.value = value;
+  if (valInput.tagName === 'SPAN') {
+    valInput.textContent = formatter ? formatter(value) : value;
+  } else {
+    valInput.value = formatter ? formatter(value) : value;
+  }
+}
+
+function captureAdvancedSettings() {
+  advancedSettingSnapshot = {
+    mappingBlend: settings.mappingBlend,
+    seamBandWidth: settings.seamBandWidth,
+    capAngle: settings.capAngle,
+    offsetU: settings.offsetU,
+    offsetV: settings.offsetV,
+    rotation: settings.rotation,
+    useDisplacement: settings.useDisplacement,
+    precisionMaskingEnabled,
+  };
+}
+
+function restoreAdvancedSettings() {
+  if (!advancedSettingSnapshot) return;
+  settings.mappingBlend = advancedSettingSnapshot.mappingBlend;
+  settings.seamBandWidth = advancedSettingSnapshot.seamBandWidth;
+  settings.capAngle = advancedSettingSnapshot.capAngle;
+  settings.offsetU = advancedSettingSnapshot.offsetU;
+  settings.offsetV = advancedSettingSnapshot.offsetV;
+  settings.rotation = advancedSettingSnapshot.rotation;
+
+  setLinkedControl(seamBlendSlider, seamBlendVal, settings.mappingBlend, v => Number(v).toFixed(2));
+  setLinkedControl(seamBandWidthSlider, seamBandWidthVal, settings.seamBandWidth, v => Number(v).toFixed(2));
+  setLinkedControl(capAngleSlider, capAngleVal, settings.capAngle, v => Math.round(Number(v)));
+  setLinkedControl(offsetUSlider, offsetUVal, settings.offsetU, v => Number(v).toFixed(2));
+  setLinkedControl(offsetVSlider, offsetVVal, settings.offsetV, v => Number(v).toFixed(2));
+  setLinkedControl(rotationSlider, rotationVal, settings.rotation, v => Math.round(Number(v)));
+
+  if (advancedSettingSnapshot.useDisplacement) {
+    dispPreviewToggle.checked = true;
+    toggleDisplacementPreview(true);
+  }
+  if (advancedSettingSnapshot.precisionMaskingEnabled && !precisionMaskingRow.classList.contains('hidden')) {
+    precisionMaskingToggle.checked = true;
+    togglePrecisionMasking(true);
+  }
+}
+
+function applyBeginnerModeUI() {
+  const beginnerMode = !!settings.beginnerMode;
+  document.body.classList.toggle('beginner-mode', beginnerMode);
+  advancedControlGroups.forEach(group => {
+    group.classList.toggle('collapsed-advanced-control', beginnerMode);
+    if (beginnerMode) group.setAttribute('aria-hidden', 'true');
+    else group.removeAttribute('aria-hidden');
+  });
+
+  if (beginnerMode) {
+    if (!advancedSettingSnapshot) captureAdvancedSettings();
+    settings.mappingBlend = 1;
+    settings.seamBandWidth = 0.35;
+    settings.capAngle = 20;
+    settings.offsetU = 0;
+    settings.offsetV = 0;
+    settings.rotation = 0;
+
+    setLinkedControl(seamBlendSlider, seamBlendVal, 1, () => '1.00');
+    setLinkedControl(seamBandWidthSlider, seamBandWidthVal, 0.35, () => '0.35');
+    setLinkedControl(capAngleSlider, capAngleVal, 20, () => 20);
+    setLinkedControl(offsetUSlider, offsetUVal, 0, () => '0.00');
+    setLinkedControl(offsetVSlider, offsetVVal, 0, () => '0.00');
+    setLinkedControl(rotationSlider, rotationVal, 0, () => 0);
+
+    if (dispPreviewToggle.checked || settings.useDisplacement) {
+      dispPreviewToggle.checked = false;
+      toggleDisplacementPreview(false);
+    }
+    if (precisionMaskingEnabled) {
+      precisionMaskingToggle.checked = false;
+      togglePrecisionMasking(false);
+    }
+  } else {
+    restoreAdvancedSettings();
+    advancedSettingSnapshot = null;
+  }
+  checkResolutionWarning();
+  updatePreview();
+}
 
 function _applyScaleU(v) {
   v = Math.max(0.01, Math.min(10, v));
@@ -319,6 +413,11 @@ initViewer(canvas);
 
 // Apply saved theme to 3D viewport on startup
 setViewerTheme(document.documentElement.getAttribute('data-theme') === 'light');
+
+const beginnerModeKey = 'stlt-beginner-mode';
+const savedBeginnerMode = localStorage.getItem(beginnerModeKey);
+settings.beginnerMode = savedBeginnerMode === null ? true : savedBeginnerMode !== '0';
+if (beginnerModeToggle) beginnerModeToggle.checked = settings.beginnerMode;
 
 // Populate the language selector
 function populateLanguageSelector() {
@@ -733,6 +832,12 @@ function wireEvents() {
   });
 
   // ── Settings ──
+  beginnerModeToggle?.addEventListener('change', () => {
+    settings.beginnerMode = beginnerModeToggle.checked;
+    localStorage.setItem(beginnerModeKey, settings.beginnerMode ? '1' : '0');
+    applyBeginnerModeUI();
+  });
+
   mappingSelect.addEventListener('change', () => {
     settings.mappingMode = parseInt(mappingSelect.value, 10);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
@@ -870,6 +975,7 @@ function wireEvents() {
 
   // ── Projection toggle ──
   projectionToggle.addEventListener('change', () => setProjection(projectionToggle.checked));
+  applyBeginnerModeUI();
 
   // ── Exclusion tool wiring ─────────────────────────────────────────────────
 
