@@ -3,10 +3,12 @@ import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWirefram
          getControls, getCamera, getCurrentMesh,
          setExclusionOverlay, setHoverPreview, setViewerTheme,
          setProjection, requestRender,
-         clearDiagOverlays, setDiagEdges, addDiagFaces } from './viewer.js';
+         clearDiagOverlays, setDiagEdges, addDiagFaces,
+         setFaceScalarOverlay, setSplitView } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
 import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
+import { computeUV } from './mapping.js';
 import { subdivide }          from './subdivision.js';
 import { applyDisplacement }  from './displacement.js';
 import { decimate }           from './decimation.js';
@@ -15,6 +17,7 @@ import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions, getShellAssignments } from './meshValidation.js';
+import { computeUV } from './mapping.js';
 import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
 import { computeUV } from './mapping.js';
 
@@ -55,6 +58,7 @@ let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
 let exportWorker          = null;
+const EXPORT_STAGE_DEBUG = /\bexportStageDebug=1\b/.test(window.location.search);
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
 let _spatialGrid = null;
@@ -62,6 +66,7 @@ let _spatialCellSize = 0;
 let _spatialMinX = 0, _spatialMinY = 0, _spatialMinZ = 0;
 
 const settings = {
+  beginnerMode:  true,
   mappingMode:   5,     // Triplanar default
   scaleU:        0.5,
   scaleV:        0.5,
@@ -185,8 +190,10 @@ let diagToken        = 0;
 let lastFastDiag     = null;   // cached fast diagnostics result for language refresh
 let lastAdvancedDiag = null;   // cached advanced diagnostics result for language refresh
 let activeDiagHighlight = null; // which highlight is showing: 'openEdges'|'nonManifold'|'shells'|'overlaps'|null
-let lastVaseMetrics = null;    // cached from latest displacement pipeline run
-let vaseValidationCache = { key: '', metrics: null };
+const activeAnalysisOverlays = {
+  signedDisplacement: false,
+  triangleDensity: false,
+};
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
@@ -212,7 +219,10 @@ const vaseModeSafeToggle = document.getElementById('vase-mode-safe');
 const triLimitWarning  = document.getElementById('tri-limit-warning');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
+const overlayModeSelect = document.getElementById('overlay-mode');
+const splitViewToggle   = document.getElementById('split-view-toggle');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
+const beginnerModeToggle = document.getElementById('beginner-mode-toggle');
 
 const mappingSelect   = document.getElementById('mapping-mode');
 const scaleUSlider    = document.getElementById('scale-u');
@@ -289,6 +299,7 @@ const meshDiagFast       = document.getElementById('mesh-diag-fast');
 const meshDiagRunBtn     = document.getElementById('mesh-diag-run-btn');
 const meshDiagSpinner    = document.getElementById('mesh-diag-spinner');
 const meshDiagAdvanced   = document.getElementById('mesh-diag-advanced');
+const advancedControlGroups = Array.from(document.querySelectorAll('.advanced-control-group'));
 
 // ── License panel DOM refs ────────────────────────────────────────────────────
 const licenseLink    = document.getElementById('license-link');
@@ -308,6 +319,97 @@ const _LOG_MIN = Math.log(0.05);
 const _LOG_MAX = Math.log(10);
 const scaleToPos = v => Math.round(Math.max(0, Math.min(1000, (Math.log(Math.max(0.01, Math.min(10, v))) - _LOG_MIN) / (_LOG_MAX - _LOG_MIN) * 1000)));
 const posToScale = p => parseFloat(Math.exp(_LOG_MIN + (p / 1000) * (_LOG_MAX - _LOG_MIN)).toFixed(2));
+let advancedSettingSnapshot = null;
+
+function setLinkedControl(slider, valInput, value, formatter = null) {
+  if (!slider || !valInput) return;
+  slider.value = value;
+  if (valInput.tagName === 'SPAN') {
+    valInput.textContent = formatter ? formatter(value) : value;
+  } else {
+    valInput.value = formatter ? formatter(value) : value;
+  }
+}
+
+function captureAdvancedSettings() {
+  advancedSettingSnapshot = {
+    mappingBlend: settings.mappingBlend,
+    seamBandWidth: settings.seamBandWidth,
+    capAngle: settings.capAngle,
+    offsetU: settings.offsetU,
+    offsetV: settings.offsetV,
+    rotation: settings.rotation,
+    useDisplacement: settings.useDisplacement,
+    precisionMaskingEnabled,
+  };
+}
+
+function restoreAdvancedSettings() {
+  if (!advancedSettingSnapshot) return;
+  settings.mappingBlend = advancedSettingSnapshot.mappingBlend;
+  settings.seamBandWidth = advancedSettingSnapshot.seamBandWidth;
+  settings.capAngle = advancedSettingSnapshot.capAngle;
+  settings.offsetU = advancedSettingSnapshot.offsetU;
+  settings.offsetV = advancedSettingSnapshot.offsetV;
+  settings.rotation = advancedSettingSnapshot.rotation;
+
+  setLinkedControl(seamBlendSlider, seamBlendVal, settings.mappingBlend, v => Number(v).toFixed(2));
+  setLinkedControl(seamBandWidthSlider, seamBandWidthVal, settings.seamBandWidth, v => Number(v).toFixed(2));
+  setLinkedControl(capAngleSlider, capAngleVal, settings.capAngle, v => Math.round(Number(v)));
+  setLinkedControl(offsetUSlider, offsetUVal, settings.offsetU, v => Number(v).toFixed(2));
+  setLinkedControl(offsetVSlider, offsetVVal, settings.offsetV, v => Number(v).toFixed(2));
+  setLinkedControl(rotationSlider, rotationVal, settings.rotation, v => Math.round(Number(v)));
+
+  if (advancedSettingSnapshot.useDisplacement) {
+    dispPreviewToggle.checked = true;
+    toggleDisplacementPreview(true);
+  }
+  if (advancedSettingSnapshot.precisionMaskingEnabled && !precisionMaskingRow.classList.contains('hidden')) {
+    precisionMaskingToggle.checked = true;
+    togglePrecisionMasking(true);
+  }
+}
+
+function applyBeginnerModeUI() {
+  const beginnerMode = !!settings.beginnerMode;
+  document.body.classList.toggle('beginner-mode', beginnerMode);
+  advancedControlGroups.forEach(group => {
+    group.classList.toggle('collapsed-advanced-control', beginnerMode);
+    if (beginnerMode) group.setAttribute('aria-hidden', 'true');
+    else group.removeAttribute('aria-hidden');
+  });
+
+  if (beginnerMode) {
+    if (!advancedSettingSnapshot) captureAdvancedSettings();
+    settings.mappingBlend = 1;
+    settings.seamBandWidth = 0.35;
+    settings.capAngle = 20;
+    settings.offsetU = 0;
+    settings.offsetV = 0;
+    settings.rotation = 0;
+
+    setLinkedControl(seamBlendSlider, seamBlendVal, 1, () => '1.00');
+    setLinkedControl(seamBandWidthSlider, seamBandWidthVal, 0.35, () => '0.35');
+    setLinkedControl(capAngleSlider, capAngleVal, 20, () => 20);
+    setLinkedControl(offsetUSlider, offsetUVal, 0, () => '0.00');
+    setLinkedControl(offsetVSlider, offsetVVal, 0, () => '0.00');
+    setLinkedControl(rotationSlider, rotationVal, 0, () => 0);
+
+    if (dispPreviewToggle.checked || settings.useDisplacement) {
+      dispPreviewToggle.checked = false;
+      toggleDisplacementPreview(false);
+    }
+    if (precisionMaskingEnabled) {
+      precisionMaskingToggle.checked = false;
+      togglePrecisionMasking(false);
+    }
+  } else {
+    restoreAdvancedSettings();
+    advancedSettingSnapshot = null;
+  }
+  checkResolutionWarning();
+  updatePreview();
+}
 
 function _applyScaleU(v) {
   v = Math.max(0.01, Math.min(10, v));
@@ -326,6 +428,11 @@ initViewer(canvas);
 
 // Apply saved theme to 3D viewport on startup
 setViewerTheme(document.documentElement.getAttribute('data-theme') === 'light');
+
+const beginnerModeKey = 'stlt-beginner-mode';
+const savedBeginnerMode = localStorage.getItem(beginnerModeKey);
+settings.beginnerMode = savedBeginnerMode === null ? true : savedBeginnerMode !== '0';
+if (beginnerModeToggle) beginnerModeToggle.checked = settings.beginnerMode;
 
 // Populate the language selector
 function populateLanguageSelector() {
@@ -741,6 +848,12 @@ function wireEvents() {
   });
 
   // ── Settings ──
+  beginnerModeToggle?.addEventListener('change', () => {
+    settings.beginnerMode = beginnerModeToggle.checked;
+    localStorage.setItem(beginnerModeKey, settings.beginnerMode ? '1' : '0');
+    applyBeginnerModeUI();
+  });
+
   mappingSelect.addEventListener('change', () => {
     settings.mappingMode = parseInt(mappingSelect.value, 10);
     capAngleRow.style.display = settings.mappingMode === 3 ? '' : 'none';
@@ -837,6 +950,21 @@ function wireEvents() {
     clearDiagHighlight();
   });
 
+  if (diagSignedDispToggle) {
+    diagSignedDispToggle.addEventListener('change', () => {
+      activeAnalysisOverlays.signedDisplacement = diagSignedDispToggle.checked;
+      if (diagSignedDispToggle.checked) activeDiagHighlight = null;
+      refreshDiagOverlays();
+    });
+  }
+  if (diagTriDensityToggle) {
+    diagTriDensityToggle.addEventListener('change', () => {
+      activeAnalysisOverlays.triangleDensity = diagTriDensityToggle.checked;
+      if (diagTriDensityToggle.checked) activeDiagHighlight = null;
+      refreshDiagOverlays();
+    });
+  }
+
   // ── Support banner dismiss ──
   document.getElementById('store-cta-dismiss').addEventListener('click', () => {
     document.getElementById('store-cta-wrapper').classList.add('store-cta-hidden');
@@ -885,6 +1013,7 @@ function wireEvents() {
 
   // ── Projection toggle ──
   projectionToggle.addEventListener('change', () => setProjection(projectionToggle.checked));
+  applyBeginnerModeUI();
 
   // ── Exclusion tool wiring ─────────────────────────────────────────────────
 
@@ -2026,6 +2155,10 @@ async function handleModelFile(file) {
     meshDiagAdvanced.classList.add('hidden');
     lastFastDiag = null;
     lastAdvancedDiag = null;
+    activeAnalysisOverlays.signedDisplacement = false;
+    activeAnalysisOverlays.triangleDensity = false;
+    if (diagSignedDispToggle) diagSignedDispToggle.checked = false;
+    if (diagTriDensityToggle) diagTriDensityToggle.checked = false;
     clearDiagHighlight();
 
     // Reset exclusion state for the new mesh
@@ -2121,28 +2254,163 @@ function applyDiagSeverity() {
 }
 
 function clearDiagHighlight() {
-  clearDiagOverlays();
   activeDiagHighlight = null;
   // Reset all toggle buttons in the popup
   meshDiagnostics.querySelectorAll('.diag-show-btn').forEach(btn => {
     btn.textContent = t('diag.show');
   });
+  refreshDiagOverlays();
 }
 
-function toggleDiagHighlight(kind) {
-  if (activeDiagHighlight === kind) {
-    clearDiagHighlight();
-    return;
+function _buildSignedDisplacementOverlayGeo() {
+  if (!currentGeometry?.attributes?.position || !activeMapEntry?.imageData || !currentBounds) return null;
+  const srcPos = currentGeometry.attributes.position.array;
+  const srcNrm = currentGeometry.attributes.normal ? currentGeometry.attributes.normal.array : null;
+  const triVerts = currentGeometry.attributes.position.count;
+  if (!triVerts) return null;
+
+  const outPos = new Float32Array(srcPos);
+  const outNrm = srcNrm ? new Float32Array(srcNrm) : null;
+  const outCol = new Float32Array(triVerts * 3);
+  const tmpPos = new THREE.Vector3();
+  const tmpNrm = new THREE.Vector3();
+  const { imageData, width, height } = activeMapEntry;
+  const mapData = imageData.data;
+  const texMax = Math.max(width, height, 1);
+  const uvSettings = {
+    ...settings,
+    textureAspectU: texMax / Math.max(width, 1),
+    textureAspectV: texMax / Math.max(height, 1),
+  };
+
+  const maxAbsDisp = Math.max(Math.abs(settings.amplitude), 1e-6);
+  for (let i = 0; i < triVerts; i++) {
+    tmpPos.fromArray(srcPos, i * 3);
+    if (srcNrm) tmpNrm.fromArray(srcNrm, i * 3);
+    else tmpNrm.set(0, 0, 1);
+    const uv = computeUV(tmpPos, tmpNrm, settings.mappingMode, uvSettings, currentBounds);
+    let grey = 0;
+    if (uv.triplanar) {
+      for (const s of uv.samples) grey += _sampleBilinearGrey(mapData, width, height, s.u, s.v) * s.w;
+    } else {
+      grey = _sampleBilinearGrey(mapData, width, height, uv.u, uv.v);
+    }
+    const signedDisp = (settings.symmetricDisplacement ? (grey - 0.5) : grey) * settings.amplitude;
+    const signedNorm = THREE.MathUtils.clamp(signedDisp / maxAbsDisp, -1, 1);
+    const color = _signedHeatColor(signedNorm);
+    outCol[i * 3] = color.r;
+    outCol[i * 3 + 1] = color.g;
+    outCol[i * 3 + 2] = color.b;
   }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+  if (outNrm) geo.setAttribute('normal', new THREE.BufferAttribute(outNrm, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(outCol, 3));
+  return geo;
+}
+
+function _buildTriangleDensityOverlayGeo() {
+  if (!currentGeometry?.attributes?.position) return null;
+  const srcPos = currentGeometry.attributes.position.array;
+  const srcNrm = currentGeometry.attributes.normal ? currentGeometry.attributes.normal.array : null;
+  const triCount = srcPos.length / 9;
+  if (!triCount) return null;
+
+  const outPos = new Float32Array(srcPos);
+  const outNrm = srcNrm ? new Float32Array(srcNrm) : null;
+  const outCol = new Float32Array((srcPos.length / 3) * 3);
+  const areas = new Float32Array(triCount);
+  let minArea = Infinity;
+  let maxArea = 0;
+
+  for (let t = 0; t < triCount; t++) {
+    const b = t * 9;
+    const ax = srcPos[b], ay = srcPos[b + 1], az = srcPos[b + 2];
+    const bx = srcPos[b + 3], by = srcPos[b + 4], bz = srcPos[b + 5];
+    const cx = srcPos[b + 6], cy = srcPos[b + 7], cz = srcPos[b + 8];
+    const abx = bx - ax, aby = by - ay, abz = bz - az;
+    const acx = cx - ax, acy = cy - ay, acz = cz - az;
+    const crx = aby * acz - abz * acy;
+    const cry = abz * acx - abx * acz;
+    const crz = abx * acy - aby * acx;
+    const area = 0.5 * Math.sqrt(crx * crx + cry * cry + crz * crz);
+    areas[t] = area;
+    if (area < minArea) minArea = area;
+    if (area > maxArea) maxArea = area;
+  }
+
+  const safeMin = Math.max(minArea, 1e-12);
+  const safeMax = Math.max(maxArea, safeMin + 1e-12);
+  const logMin = Math.log(safeMin);
+  const logRange = Math.max(1e-12, Math.log(safeMax) - logMin);
+  for (let t = 0; t < triCount; t++) {
+    const risk = THREE.MathUtils.clamp((Math.log(Math.max(areas[t], 1e-12)) - logMin) / logRange, 0, 1);
+    const color = _signedHeatColor(risk * 2 - 1);
+    const vBase = t * 9;
+    for (let k = 0; k < 3; k++) {
+      const cIdx = vBase + k * 3;
+      outCol[cIdx] = color.r;
+      outCol[cIdx + 1] = color.g;
+      outCol[cIdx + 2] = color.b;
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+  if (outNrm) geo.setAttribute('normal', new THREE.BufferAttribute(outNrm, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(outCol, 3));
+  return geo;
+}
+
+function _sampleBilinearGrey(data, w, h, u, v) {
+  u = ((u % 1) + 1) % 1;
+  v = ((v % 1) + 1) % 1;
+  v = 1 - v;
+  const fx = u * (w - 1);
+  const fy = v * (h - 1);
+  const x0 = Math.floor(fx);
+  const y0 = Math.floor(fy);
+  const x1 = Math.min(x0 + 1, w - 1);
+  const y1 = Math.min(y0 + 1, h - 1);
+  const tx = fx - x0;
+  const ty = fy - y0;
+  const v00 = data[(y0 * w + x0) * 4] / 255;
+  const v10 = data[(y0 * w + x1) * 4] / 255;
+  const v01 = data[(y1 * w + x0) * 4] / 255;
+  const v11 = data[(y1 * w + x1) * 4] / 255;
+  return v00 * (1 - tx) * (1 - ty) + v10 * tx * (1 - ty) + v01 * (1 - tx) * ty + v11 * tx * ty;
+}
+
+function _signedHeatColor(normVal) {
+  const t = THREE.MathUtils.clamp(normVal, -1, 1);
+  const neutral = new THREE.Color(0xcbd5e1);
+  const cold = new THREE.Color(0x1d4ed8);
+  const hot = new THREE.Color(0xdc2626);
+  return t < 0 ? neutral.clone().lerp(cold, -t) : neutral.clone().lerp(hot, t);
+}
+
+function refreshDiagOverlays() {
   clearDiagOverlays();
-  activeDiagHighlight = kind;
 
   // Reset all buttons then mark the active one
   meshDiagnostics.querySelectorAll('.diag-show-btn').forEach(btn => {
-    btn.textContent = (btn.dataset.kind === kind) ? t('diag.hide') : t('diag.show');
+    btn.textContent = (btn.dataset.kind === activeDiagHighlight) ? t('diag.hide') : t('diag.show');
   });
 
   if (!currentGeometry) return;
+
+  if (activeAnalysisOverlays.signedDisplacement) {
+    const dispGeo = _buildSignedDisplacementOverlayGeo();
+    if (dispGeo) addDiagFaces(dispGeo, 0xffffff, 0.75, true, true);
+  }
+  if (activeAnalysisOverlays.triangleDensity) {
+    const densityGeo = _buildTriangleDensityOverlayGeo();
+    if (densityGeo) addDiagFaces(densityGeo, 0xffffff, 0.65, true, true);
+  }
+
+  const kind = activeDiagHighlight;
+  if (!kind) return;
 
   if (kind === 'openEdges' || kind === 'nonManifold') {
     const edgeData = getEdgePositions(currentGeometry);
@@ -2181,6 +2449,15 @@ function toggleDiagHighlight(kind) {
     const geo = buildExclusionOverlayGeo(currentGeometry, lastAdvancedDiag.overlapFaces);
     addDiagFaces(geo, 0xf59e0b, 0.7);
   }
+}
+
+function toggleDiagHighlight(kind) {
+  if (activeDiagHighlight === kind) {
+    clearDiagHighlight();
+    return;
+  }
+  activeDiagHighlight = kind;
+  refreshDiagOverlays();
 }
 
 /**
@@ -3076,6 +3353,124 @@ function getEffectiveMapEntry() {
   return _effectiveMapCache;
 }
 
+function _wrapDelta(a, b) {
+  const d = Math.abs(a - b);
+  return Math.min(d, 1 - d);
+}
+
+function _sampleLumaAtUV(imageData, width, height, u, v) {
+  if (!imageData || !imageData.data || width <= 0 || height <= 0) return 0.5;
+  const uu = ((u % 1) + 1) % 1;
+  const vv = ((v % 1) + 1) % 1;
+  const x = Math.min(width - 1, Math.max(0, Math.floor(uu * (width - 1))));
+  const y = Math.min(height - 1, Math.max(0, Math.floor((1 - vv) * (height - 1))));
+  const off = (y * width + x) * 4;
+  const d = imageData.data;
+  return (0.299 * d[off] + 0.587 * d[off + 1] + 0.114 * d[off + 2]) / 255;
+}
+
+function computeFaceStressScores(geometry, mapEntry, mapSettings) {
+  const posAttr = geometry?.getAttribute('position');
+  if (!posAttr) return { seamRisk: null, maskStress: null };
+  const pos = posAttr.array;
+  const triCount = Math.floor(posAttr.count / 3);
+  const seamRisk = new Float32Array(triCount);
+  const maskStress = new Float32Array(triCount);
+  const faceMaskAttr = geometry.getAttribute('faceMask');
+  const faceMask = faceMaskAttr?.array || null;
+  const faceNormalAttr = geometry.getAttribute('faceNormal');
+
+  const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
+  const n = new THREE.Vector3(), e1 = new THREE.Vector3(), e2 = new THREE.Vector3();
+  const uv0 = { u: 0, v: 0 }, uv1 = { u: 0, v: 0 }, uv2 = { u: 0, v: 0 };
+  const centroid = new THREE.Vector3();
+
+  const uvFromMapping = (p, normal, out) => {
+    const uv = computeUV(p, normal, settings.mappingMode, mapSettings, currentBounds);
+    if (uv?.triplanar && uv.samples?.length) {
+      let wu = 0, wv = 0, ww = 0;
+      for (const s of uv.samples) {
+        const w = s.w ?? 0;
+        wu += (s.u ?? 0) * w;
+        wv += (s.v ?? 0) * w;
+        ww += w;
+      }
+      out.u = ww > 1e-6 ? wu / ww : 0;
+      out.v = ww > 1e-6 ? wv / ww : 0;
+      return;
+    }
+    out.u = uv?.u ?? 0;
+    out.v = uv?.v ?? 0;
+  };
+
+  const du = 1 / Math.max(64, mapEntry?.width || 64);
+  const dv = 1 / Math.max(64, mapEntry?.height || 64);
+
+  for (let t = 0; t < triCount; t++) {
+    const off = t * 9;
+    v0.set(pos[off], pos[off + 1], pos[off + 2]);
+    v1.set(pos[off + 3], pos[off + 4], pos[off + 5]);
+    v2.set(pos[off + 6], pos[off + 7], pos[off + 8]);
+    if (faceNormalAttr) {
+      const no = t * 9;
+      n.set(faceNormalAttr.array[no], faceNormalAttr.array[no + 1], faceNormalAttr.array[no + 2]).normalize();
+    } else {
+      e1.subVectors(v1, v0);
+      e2.subVectors(v2, v0);
+      n.crossVectors(e1, e2).normalize();
+    }
+
+    uvFromMapping(v0, n, uv0);
+    uvFromMapping(v1, n, uv1);
+    uvFromMapping(v2, n, uv2);
+
+    const d01 = Math.hypot(_wrapDelta(uv0.u, uv1.u), _wrapDelta(uv0.v, uv1.v));
+    const d12 = Math.hypot(_wrapDelta(uv1.u, uv2.u), _wrapDelta(uv1.v, uv2.v));
+    const d20 = Math.hypot(_wrapDelta(uv2.u, uv0.u), _wrapDelta(uv2.v, uv0.v));
+    seamRisk[t] = Math.min(1, Math.max(d01, d12, d20) / 0.35);
+
+    const m0 = faceMask ? faceMask[t * 3] : 1;
+    const m1 = faceMask ? faceMask[t * 3 + 1] : m0;
+    const m2 = faceMask ? faceMask[t * 3 + 2] : m0;
+    const maskGrad = Math.max(m0, m1, m2) - Math.min(m0, m1, m2);
+
+    centroid.copy(v0).add(v1).add(v2).multiplyScalar(1 / 3);
+    const cuv = { u: 0, v: 0 };
+    uvFromMapping(centroid, n, cuv);
+    const l = _sampleLumaAtUV(mapEntry?.imageData, mapEntry?.width || 1, mapEntry?.height || 1, cuv.u, cuv.v);
+    const lx = _sampleLumaAtUV(mapEntry?.imageData, mapEntry?.width || 1, mapEntry?.height || 1, cuv.u + du, cuv.v);
+    const ly = _sampleLumaAtUV(mapEntry?.imageData, mapEntry?.width || 1, mapEntry?.height || 1, cuv.u, cuv.v + dv);
+    const texGrad = Math.min(1, Math.hypot(lx - l, ly - l) * 12);
+    maskStress[t] = Math.min(1, maskGrad * 0.65 + texGrad * 0.35);
+  }
+  return { seamRisk, maskStress };
+}
+
+function updateOverlayAndSplit(activeGeo, effectiveEntry, fullSettings) {
+  const rightGeo = (settings.useDisplacement && dispPreviewGeometry) ? dispPreviewGeometry : activeGeo;
+  const leftGeo = currentGeometry || activeGeo;
+
+  const activeScores = computeFaceStressScores(activeGeo, effectiveEntry, fullSettings);
+  const leftScores = splitViewEnabled ? computeFaceStressScores(leftGeo, effectiveEntry, fullSettings) : null;
+  const rightScores = splitViewEnabled ? computeFaceStressScores(rightGeo, effectiveEntry, fullSettings) : null;
+
+  const pick = (scores) => {
+    if (!scores || overlayMode === 'none') return null;
+    if (overlayMode === 'seam-risk') return scores.seamRisk;
+    if (overlayMode === 'mask-stress') return scores.maskStress;
+    return null;
+  };
+
+  setFaceScalarOverlay({
+    mode: overlayMode,
+    geometry: activeGeo,
+    scores: pick(activeScores),
+    splitLeft: splitViewEnabled ? { geometry: leftGeo, scores: pick(leftScores) } : null,
+    splitRight: splitViewEnabled ? { geometry: rightGeo, scores: pick(rightScores) } : null,
+  });
+  setSplitView(splitViewEnabled, leftGeo, rightGeo);
+}
+
 function updatePreview() {
   if (!currentGeometry || !currentBounds) return;
 
@@ -3124,10 +3519,15 @@ function updatePreview() {
     updateMaterial(previewMaterial, effectiveEntry.texture, fullSettings);
   }
 
+  updateOverlayAndSplit(activeGeo, effectiveEntry, fullSettings);
+
   syncBoundaryEdgeUniforms();
   exportBtn.disabled = false;
   export3mfBtn.disabled = false;
   renderExportValidation();
+  if (activeAnalysisOverlays.signedDisplacement || activeAnalysisOverlays.triangleDensity || activeDiagHighlight) {
+    refreshDiagOverlays();
+  }
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
@@ -3612,6 +4012,7 @@ async function handleExport(format = 'stl') {
   let displaced       = null;
   let finalGeometry   = null;
   let exportSucceeded = false; // set true only after exportSTL so finally can clean up on abort/error
+  const stageStats = { maxObservedMB: 0 };
 
   try {
     setProgress(0.02, t('progress.subdividing'));
@@ -3629,8 +4030,10 @@ async function handleExport(format = 'stl') {
 
     const exportEntry = getEffectiveMapEntry();
     let safetyCapHit = false;
+    let workerDecimationFailed = false;
     try {
-      ({ geometry: displaced, safetyCapHit } = await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed } =
+        await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
     } catch (workerErr) {
       console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
       ({ geometry: subdivided, safetyCapHit } = await subdivide(
@@ -3661,8 +4064,10 @@ async function handleExport(format = 'stl') {
       );
       if (exportToken !== myToken) return;
 
-      // Free subdivided geometry — displacement created a separate copy
-      subdivided.dispose();
+      // Free subdivided geometry immediately after handoff to displacement stage.
+      releaseGeometryBuffers(subdivided, 'subdivision->displacement');
+      subdivided = null;
+      observeExportStage('displacement', displaced, stageStats);
     }
     if (exportToken !== myToken) return;
 
@@ -3674,6 +4079,9 @@ async function handleExport(format = 'stl') {
 
     finalGeometry = displaced;
     if (needsDecimation) {
+      if (workerDecimationFailed) {
+        console.warn('Worker decimation failed, running main-thread decimation fallback.');
+      }
       setProgress(0.71, t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
       finalGeometry = await runAsync(() =>
         decimate(
@@ -3688,9 +4096,13 @@ async function handleExport(format = 'stl') {
           }
         )
       );
-      // Free pre-decimation geometry — decimate created a separate copy
-      displaced.dispose();
+      observeExportStage('decimation', finalGeometry, stageStats);
+      // Free pre-decimation geometry immediately after handoff to decimation output.
+      releaseGeometryBuffers(displaced, 'displacement->decimation');
+      displaced = null;
 	  if (exportToken !== myToken) return;
+    } else {
+      observeExportStage('decimation-skipped', finalGeometry, stageStats);
     }
 
     // Flat-bottom clamp: when bottom faces are masked (bottomAngleLimit > 0),
@@ -3731,16 +4143,33 @@ async function handleExport(format = 'stl') {
       setProgress(0.97, t('progress.writing3mf'));
       await yieldFrame();
       if (exportToken !== myToken) return;
+      observeExportStage('write-3mf', finalGeometry, stageStats);
       export3MF(finalGeometry, `${baseName}.3mf`);
     } else {
       setProgress(0.97, t('progress.writingStl'));
       await yieldFrame();
       if (exportToken !== myToken) return;
+      observeExportStage('write-stl', finalGeometry, stageStats);
       exportSTL(finalGeometry, `${baseName}.stl`);
     }
+    releaseGeometryBuffers(finalGeometry, 'write-complete');
+    finalGeometry = null;
     exportSucceeded = true;
 
-    setProgress(1.0, t('progress.done'));
+    const doneLabel = EXPORT_STAGE_DEBUG && stageStats.maxObservedMB > 0
+      ? `${t('progress.done')} · max ~${stageStats.maxObservedMB.toFixed(1)} MB`
+      : t('progress.done');
+    setProgress(1.0, doneLabel);
+    if (EXPORT_STAGE_DEBUG && stageStats.maxObservedMB > 0) {
+      console.info(
+        `[export][summary] max-observed-buffer-estimate=${stageStats.maxObservedMB.toFixed(2)} MB`
+      );
+      if (stageStats.maxObservedMB > 512) {
+        console.warn(
+          `[export][warning] high peak stage estimate (${stageStats.maxObservedMB.toFixed(2)} MB)`
+        );
+      }
+    }
     setTimeout(() => {
       exportProgress.classList.add('hidden');
       setProgress(0, '');
@@ -3755,9 +4184,11 @@ async function handleExport(format = 'stl') {
   } finally {
     // Dispose all intermediate geometries regardless of success, failure, or abort.
     // finalGeometry may alias displaced (no decimation) — avoid double-dispose.
-    if (subdivided) subdivided.dispose();
-    if (displaced && displaced !== subdivided) displaced.dispose();
-    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) finalGeometry.dispose();
+    if (subdivided) releaseGeometryBuffers(subdivided, 'finally-subdivided');
+    if (displaced && displaced !== subdivided) releaseGeometryBuffers(displaced, 'finally-displaced');
+    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) {
+      releaseGeometryBuffers(finalGeometry, 'finally-final');
+    }
     // Hide progress immediately on error or stale abort; success hides it after 1500 ms.
     if (!exportSucceeded) exportProgress.classList.add('hidden');
     isExporting = false;
@@ -3771,6 +4202,41 @@ function setProgress(fraction, label) {
   exportProgBar.style.width = `${pct}%`;
   exportProgPct.textContent = `${pct}%`;
   exportProgLbl.textContent = label;
+}
+
+function estimateGeometryBufferMB(geo) {
+  if (!geo?.attributes) return 0;
+  let bytes = 0;
+  for (const attr of Object.values(geo.attributes)) {
+    if (attr?.array?.byteLength) bytes += attr.array.byteLength;
+  }
+  if (geo.index?.array?.byteLength) bytes += geo.index.array.byteLength;
+  return bytes / (1024 * 1024);
+}
+
+function observeExportStage(stageName, geo, stageStats) {
+  if (!geo?.attributes?.position) return;
+  const triCount = geo.attributes.position.count / 3;
+  const estimateMB = estimateGeometryBufferMB(geo);
+  if (stageStats && estimateMB > stageStats.maxObservedMB) stageStats.maxObservedMB = estimateMB;
+  if (EXPORT_STAGE_DEBUG) {
+    console.info(
+      `[export][stage] ${stageName} | tris=${triCount.toLocaleString()} | buffers~${estimateMB.toFixed(2)} MB`
+    );
+  }
+}
+
+function releaseGeometryBuffers(geo, label = '') {
+  if (!geo) return;
+  if (EXPORT_STAGE_DEBUG) {
+    const mb = estimateGeometryBufferMB(geo);
+    console.info(`[export][release] ${label || 'geometry'} | buffers~${mb.toFixed(2)} MB`);
+  }
+  if (geo.attributes) {
+    for (const name of Object.keys(geo.attributes)) geo.deleteAttribute(name);
+  }
+  geo.setIndex(null);
+  geo.dispose();
 }
 
 /**
@@ -3823,7 +4289,10 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
       height: exportEntry.height,
     },
     refineLength: settings.refineLength,
+    maxTriangles: settings.maxTriangles,
+    decimationOptions: {},
     settings: { ...settings },
+    debugStageStats: EXPORT_STAGE_DEBUG,
     bounds: {
       min: { x: currentBounds.min.x, y: currentBounds.min.y, z: currentBounds.min.z },
       max: { x: currentBounds.max.x, y: currentBounds.max.y, z: currentBounds.max.z },
@@ -3849,6 +4318,23 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
           setProgress(0.02 + (data.fraction ?? 0) * 0.35, label);
         } else if (data.phase === 'displace') {
           setProgress(0.38 + (data.fraction ?? 0) * 0.32, t('progress.displacingVertices'));
+        } else if (data.phase === 'decimate') {
+          const triCount = data.triCount ?? 0;
+          const target = data.targetTriangles ?? settings.maxTriangles;
+          if (data.failed) {
+            setProgress(0.96, t('progress.decimatingTo', {
+              from: triCount.toLocaleString(),
+              to: target.toLocaleString(),
+            }));
+          } else {
+            setProgress(
+              0.71 + (data.fraction ?? 0) * 0.25,
+              t('progress.decimating', {
+                cur: triCount.toLocaleString(),
+                to: target.toLocaleString(),
+              })
+            );
+          }
         }
         return;
       }
@@ -3857,8 +4343,11 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
         geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
-        if (data.vaseMetrics) geo.userData.vaseMetrics = data.vaseMetrics;
-        resolve({ geometry: geo, safetyCapHit: !!data.safetyCapHit });
+        resolve({
+          geometry: geo,
+          safetyCapHit: !!data.safetyCapHit,
+          decimationFailed: !!data.decimationFailed,
+        });
         return;
       }
       if (data.type === 'error') {

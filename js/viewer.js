@@ -26,6 +26,12 @@ let _hoverMaterial = null;
 let _needsRender = true;
 let _diagEdges = null;       // LineSegments2 for open/non-manifold edges
 let _diagFaces = [];         // Array of THREE.Mesh overlays for face highlights
+let _scalarOverlay = null;   // Face-colour scalar overlay for current mesh mode
+let _splitScalarLeft = null; // Face-colour overlay for split left mesh
+let _splitScalarRight = null;// Face-colour overlay for split right mesh
+let _splitViewEnabled = false;
+let _splitLeftMesh = null;
+let _splitRightMesh = null;
 
 // Build a labelled coordinate axes indicator scaled to `size`.
 // X = red, Y = green, Z = blue (up).
@@ -435,7 +441,40 @@ export function initViewer(canvas) {
     controls.update();
     if (_needsRender) {
       _needsRender = false;
-      renderer.render(scene, camera);
+      if (_splitViewEnabled && _splitLeftMesh && _splitRightMesh) {
+        const size = renderer.getSize(new THREE.Vector2());
+        const w = Math.max(1, Math.floor(size.x));
+        const h = Math.max(1, Math.floor(size.y));
+        const mid = Math.floor(w / 2);
+        renderer.setScissorTest(true);
+        renderer.clear();
+
+        _splitLeftMesh.visible = true;
+        _splitRightMesh.visible = false;
+        if (_scalarOverlay) _scalarOverlay.visible = false;
+        if (_splitScalarLeft) _splitScalarLeft.visible = true;
+        if (_splitScalarRight) _splitScalarRight.visible = false;
+        renderer.setViewport(0, 0, mid, h);
+        renderer.setScissor(0, 0, mid, h);
+        renderer.render(scene, camera);
+
+        _splitLeftMesh.visible = false;
+        _splitRightMesh.visible = true;
+        if (_splitScalarLeft) _splitScalarLeft.visible = false;
+        if (_splitScalarRight) _splitScalarRight.visible = true;
+        renderer.setViewport(mid, 0, w - mid, h);
+        renderer.setScissor(mid, 0, w - mid, h);
+        renderer.render(scene, camera);
+
+        renderer.setScissorTest(false);
+      } else {
+        if (_splitLeftMesh) _splitLeftMesh.visible = false;
+        if (_splitRightMesh) _splitRightMesh.visible = false;
+        if (_splitScalarLeft) _splitScalarLeft.visible = false;
+        if (_splitScalarRight) _splitScalarRight.visible = false;
+        if (_scalarOverlay) _scalarOverlay.visible = true;
+        renderer.render(scene, camera);
+      }
     }
   })();
 }
@@ -504,6 +543,7 @@ export function loadGeometry(geometry, material) {
   currentMesh.castShadow = true;
   currentMesh.receiveShadow = true;
   meshGroup.add(currentMesh);
+  currentMesh.visible = !_splitViewEnabled;
 
   // Rebuild wireframe overlay to match the new geometry
   // (old overlay is already gone because meshGroup was cleared above)
@@ -553,6 +593,8 @@ export function setMeshMaterial(material) {
     metalness: 0.1,
     side: THREE.DoubleSide,
   });
+  if (_splitLeftMesh) _splitLeftMesh.material = currentMesh.material;
+  if (_splitRightMesh) _splitRightMesh.material = currentMesh.material;
   requestRender();
 }
 
@@ -566,6 +608,12 @@ export function setMeshGeometry(geometry) {
   if (!currentMesh) return;
   if (!geometry.attributes.normal) geometry.computeVertexNormals();
   currentMesh.geometry = geometry;
+  if (_splitLeftMesh && !_splitLeftMesh.geometry.userData?.isOriginalRef) {
+    _splitLeftMesh.geometry = geometry;
+  }
+  if (_splitRightMesh && !_splitRightMesh.geometry.userData?.isOriginalRef) {
+    _splitRightMesh.geometry = geometry;
+  }
   // Rebuild wireframe overlay to match the new geometry
   if (wireframeLines) {
     meshGroup.remove(wireframeLines);
@@ -884,10 +932,11 @@ export function setDiagEdges(positions, color = 0xff0000) {
  * @param {number}               color       – hex colour
  * @param {number}               [opacity=0.6]
  */
-export function addDiagFaces(overlayGeo, color, opacity = 0.6, xray = false) {
+export function addDiagFaces(overlayGeo, color, opacity = 0.6, xray = false, useVertexColors = false) {
   if (!overlayGeo || overlayGeo.attributes.position.count === 0) return;
   const mat = new THREE.MeshBasicMaterial({
-    color,
+    color: useVertexColors ? 0xffffff : color,
+    vertexColors: useVertexColors,
     side: THREE.DoubleSide,
     transparent: true,
     opacity,
@@ -900,5 +949,123 @@ export function addDiagFaces(overlayGeo, color, opacity = 0.6, xray = false) {
   mesh.renderOrder = 1;
   _diagFaces.push(mesh);
   scene.add(mesh);
+  requestRender();
+}
+
+function _disposeMeshRef(refName) {
+  const mesh = refName === 'left' ? _splitLeftMesh : _splitRightMesh;
+  if (!mesh) return;
+  if (mesh.parent) mesh.parent.remove(mesh);
+  if (refName === 'left') _splitLeftMesh = null;
+  else _splitRightMesh = null;
+}
+
+function _clearScalarMesh(refName) {
+  const mesh = refName === 'single' ? _scalarOverlay : refName === 'left' ? _splitScalarLeft : _splitScalarRight;
+  if (!mesh) return;
+  if (mesh.parent) mesh.parent.remove(mesh);
+  mesh.geometry.dispose();
+  mesh.material.dispose();
+  if (refName === 'single') _scalarOverlay = null;
+  else if (refName === 'left') _splitScalarLeft = null;
+  else _splitScalarRight = null;
+}
+
+function _buildScalarOverlay(geometry, faceScores, opacity = 0.75) {
+  if (!geometry || !faceScores || faceScores.length === 0) return null;
+  const pos = geometry.attributes.position;
+  if (!pos || pos.count === 0) return null;
+  const triCount = Math.floor(pos.count / 3);
+  if (triCount === 0) return null;
+
+  let min = Infinity, max = -Infinity;
+  for (let i = 0; i < faceScores.length; i++) {
+    const v = Number.isFinite(faceScores[i]) ? faceScores[i] : 0;
+    if (v < min) min = v;
+    if (v > max) max = v;
+  }
+  const span = Math.max(1e-6, max - min);
+  const colors = new Float32Array(pos.count * 3);
+  const c = new THREE.Color();
+
+  const mapColor = (t) => {
+    const clamped = Math.max(0, Math.min(1, t));
+    const hue = (1 - clamped) * 0.65;
+    c.setHSL(hue, 0.9, 0.5);
+    return c;
+  };
+
+  for (let t = 0; t < triCount; t++) {
+    const score = Number.isFinite(faceScores[t]) ? faceScores[t] : 0;
+    const color = mapColor((score - min) / span);
+    for (let v = 0; v < 3; v++) {
+      const out = (t * 3 + v) * 3;
+      colors[out] = color.r;
+      colors[out + 1] = color.g;
+      colors[out + 2] = color.b;
+    }
+  }
+
+  const overlayGeo = new THREE.BufferGeometry();
+  overlayGeo.setAttribute('position', pos.clone());
+  overlayGeo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  const mat = new THREE.MeshBasicMaterial({
+    vertexColors: true,
+    transparent: true,
+    opacity,
+    side: THREE.DoubleSide,
+    depthTest: true,
+    polygonOffset: true,
+    polygonOffsetFactor: -1.5,
+    polygonOffsetUnits: -1.5,
+  });
+  const mesh = new THREE.Mesh(overlayGeo, mat);
+  mesh.renderOrder = 2;
+  return mesh;
+}
+
+export function setFaceScalarOverlay({ mode = 'none', geometry = null, scores = null, splitLeft = null, splitRight = null, opacity = 0.72 } = {}) {
+  _clearScalarMesh('single');
+  _clearScalarMesh('left');
+  _clearScalarMesh('right');
+  if (mode === 'none') { requestRender(); return; }
+
+  _scalarOverlay = _buildScalarOverlay(geometry, scores, opacity);
+  if (_scalarOverlay) scene.add(_scalarOverlay);
+
+  if (splitLeft && splitLeft.geometry && splitLeft.scores) {
+    _splitScalarLeft = _buildScalarOverlay(splitLeft.geometry, splitLeft.scores, opacity);
+    if (_splitScalarLeft) scene.add(_splitScalarLeft);
+  }
+  if (splitRight && splitRight.geometry && splitRight.scores) {
+    _splitScalarRight = _buildScalarOverlay(splitRight.geometry, splitRight.scores, opacity);
+    if (_splitScalarRight) scene.add(_splitScalarRight);
+  }
+  requestRender();
+}
+
+export function setSplitView(enabled, originalGeometry = null, displacedGeometry = null) {
+  _splitViewEnabled = !!enabled;
+  if (!_splitViewEnabled || !currentMesh || !originalGeometry || !displacedGeometry) {
+    _disposeMeshRef('left');
+    _disposeMeshRef('right');
+    if (currentMesh) currentMesh.visible = true;
+    requestRender();
+    return;
+  }
+
+  _disposeMeshRef('left');
+  _disposeMeshRef('right');
+  _splitLeftMesh = new THREE.Mesh(originalGeometry, currentMesh.material);
+  _splitLeftMesh.geometry.userData = { ...(_splitLeftMesh.geometry.userData || {}), isOriginalRef: true };
+  _splitRightMesh = new THREE.Mesh(displacedGeometry, currentMesh.material);
+  _splitRightMesh.geometry.userData = { ...(_splitRightMesh.geometry.userData || {}), isOriginalRef: false };
+  _splitLeftMesh.castShadow = _splitRightMesh.castShadow = true;
+  _splitLeftMesh.receiveShadow = _splitRightMesh.receiveShadow = true;
+  _splitLeftMesh.visible = true;
+  _splitRightMesh.visible = false;
+  scene.add(_splitLeftMesh);
+  scene.add(_splitRightMesh);
+  currentMesh.visible = false;
   requestRender();
 }

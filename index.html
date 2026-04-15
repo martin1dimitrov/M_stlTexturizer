@@ -68,13 +68,13 @@
         <div id="mesh-diagnostics" class="mesh-diagnostics hidden">
           <button id="mesh-diag-dismiss" class="mesh-diag-dismiss" aria-label="Dismiss">&times;</button>
           <div id="mesh-diag-fast" class="mesh-diag-results"></div>
-          <div class="mesh-diag-advanced-row">
+          <div class="mesh-diag-advanced-row advanced-control-group">
             <button id="mesh-diag-run-btn" class="mesh-diag-run-btn"
               data-i18n="diag.runAdvanced" data-i18n-title="diag.runAdvancedTitle"
               title="Check for intersecting and overlapping triangles (may take a moment on large meshes)">Run Advanced Checks</button>
             <span id="mesh-diag-spinner" class="mesh-diag-spinner hidden"></span>
           </div>
-          <div id="mesh-diag-advanced" class="mesh-diag-results hidden"></div>
+          <div id="mesh-diag-advanced" class="mesh-diag-results hidden advanced-control-group"></div>
         </div>
         <div id="store-cta-wrapper">
           <span id="store-cta">
@@ -91,6 +91,18 @@
         <label class="wireframe-toggle">
           <input type="checkbox" id="projection-toggle" />
           <span data-i18n="ui.perspective">Perspective View</span>
+        </label>
+        <label class="wireframe-toggle">
+          <span>Overlay</span>
+          <select id="overlay-mode" class="overlay-select">
+            <option value="none" selected>None</option>
+            <option value="seam-risk">Seam Risk</option>
+            <option value="mask-stress">Mask Stress</option>
+          </select>
+        </label>
+        <label class="wireframe-toggle">
+          <input type="checkbox" id="split-view-toggle" />
+          <span>Split View</span>
         </label>
 
         <div class="viewport-controls-hint" data-i18n="ui.controlsHint">Left drag: orbit &nbsp;·&nbsp; Right drag: pan &nbsp;·&nbsp; Scroll: zoom</div>
@@ -113,6 +125,12 @@
           </button>
         </div>
         <p style="margin:.4em 0 0;font-size:.75rem;opacity:.55;text-align:center;" data-i18n="ui.localProcessingNote">All processing runs locally in your browser — no data is uploaded.</p>
+        <div class="form-row beginner-mode-row">
+          <label class="checkbox-label" for="beginner-mode-toggle" title="Hide advanced controls and use safer defaults">
+            <input type="checkbox" id="beginner-mode-toggle" checked />
+            <span>Beginner Mode</span>
+          </label>
+        </div>
       </section>
 
       <!-- Displacement Map -->
@@ -132,7 +150,7 @@
         <input type="file" id="texture-file-input" accept="image/*" hidden />
         <div id="active-map-name" class="active-map-name" data-i18n="ui.noMapSelected">No map selected</div>
         <div id="texture-validation" class="texture-validation hidden"></div>
-        <div class="form-row slider-row">
+        <div class="form-row slider-row advanced-control-group">
           <label for="texture-smoothing" data-i18n="labels.textureSmoothing" data-i18n-title="tooltips.textureSmoothing" title="Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.">Texture Smoothing ⓘ</label>
           <input type="range" id="texture-smoothing" min="0" max="20" step="any" value="0" />
           <input type="number" class="val" id="texture-smoothing-val" value="0" min="0" max="20" step="any" data-wheel-decimals="1" />
@@ -154,17 +172,17 @@
             <option value="2" data-i18n-opt="projection.planarYZ">Planar YZ</option>
           </select>
         </div>
-        <div class="form-row slider-row" style="display:none">
+        <div class="form-row slider-row advanced-control-group" style="display:none">
           <label for="seam-blend" data-i18n="labels.seamBlend" data-i18n-title="tooltips.seamBlend" title="Softens the hard seam where projection faces meet. Effective for Cubic and Cylindrical modes.">Seam Blend ⓘ</label>
           <input type="range" id="seam-blend" min="0" max="1" step="0.01" value="1" />
           <input type="number" class="val" id="seam-blend-val" value="1" min="0" max="1" step="0.01" />
         </div>
-        <div class="form-row slider-row">
+        <div class="form-row slider-row advanced-control-group">
           <label for="seam-band-width" data-i18n="labels.transitionSmoothing" data-i18n-title="tooltips.transitionSmoothing" title="Width of the blending zone near seam edges. Lower values keep transitions tight to the seam; higher values blend a wider band.">Transition Smoothing ⓘ</label>
           <input type="range" id="seam-band-width" min="0" max="1" step="0.01" value="0.5" />
           <input type="number" class="val" id="seam-band-width-val" value="0.5" min="0" max="1" step="0.01" data-wheel-decimals="2" />
         </div>
-        <div class="form-row slider-row" id="cap-angle-row" style="display:none">
+        <div class="form-row slider-row advanced-control-group" id="cap-angle-row" style="display:none">
           <label for="cap-angle" data-i18n="labels.capAngle" data-i18n-title="tooltips.capAngle" title="Angle (in degrees) from vertical at which the top/bottom cap projection kicks in. Smaller values limit cap projection to nearly flat faces.">Cap Angle ⓘ</label>
           <input type="range" id="cap-angle" min="1" max="89" step="1" value="20" />
           <input type="number" class="val" id="cap-angle-val" value="20" min="1" max="89" step="1" />
@@ -221,22 +239,22 @@
           <div class="lock-line"></div>
         </div>
 
-        <div class="form-row slider-row">
+        <div class="form-row slider-row advanced-control-group">
           <label for="scale-v" data-i18n="labels.scaleV">Scale V</label>
           <input type="range" id="scale-v" min="0" max="1000" step="1" value="435" />
           <input type="number" class="val" id="scale-v-val" value="0.50" min="0.05" max="10" step="0.05" />
         </div>
-        <div class="form-row slider-row">
+        <div class="form-row slider-row advanced-control-group">
           <label for="offset-u" data-i18n="labels.offsetU">Offset U</label>
           <input type="range" id="offset-u" min="-1" max="1" step="0.01" value="0" />
           <input type="number" class="val" id="offset-u-val" value="0" min="-1" max="1" step="0.01" />
         </div>
-        <div class="form-row slider-row">
+        <div class="form-row slider-row advanced-control-group">
           <label for="offset-v" data-i18n="labels.offsetV">Offset V</label>
           <input type="range" id="offset-v" min="-1" max="1" step="0.01" value="0" />
           <input type="number" class="val" id="offset-v-val" value="0" min="-1" max="1" step="0.01" />
         </div>
-        <div class="form-row slider-row">
+        <div class="form-row slider-row advanced-control-group">
           <label for="rotation" data-i18n="labels.rotation">Rotation</label>
           <input type="range" id="rotation" min="0" max="360" step="1" value="0" />
           <input type="number" class="val" id="rotation-val" value="0" min="0" max="360" step="1" />
