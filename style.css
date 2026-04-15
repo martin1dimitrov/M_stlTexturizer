@@ -1009,6 +1009,32 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 
 .mesh-diag-spinner.hidden { display: none; }
 
+.mesh-diag-analysis {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid color-mix(in srgb, currentColor 35%, transparent);
+}
+
+.mesh-diag-analysis-title {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  opacity: 0.85;
+  margin-bottom: 4px;
+}
+
+.mesh-diag-analysis-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.mesh-diag-analysis-item + .mesh-diag-analysis-item {
+  margin-top: 3px;
+}
+
 @keyframes diag-spin { to { transform: rotate(360deg); } }
 
 /* ── Surface Exclusions panel ────────────────────────────────────────────── */

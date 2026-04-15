@@ -15,6 +15,7 @@ import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions, getShellAssignments } from './meshValidation.js';
+import { computeUV } from './mapping.js';
 import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
@@ -183,6 +184,10 @@ let diagToken        = 0;
 let lastFastDiag     = null;   // cached fast diagnostics result for language refresh
 let lastAdvancedDiag = null;   // cached advanced diagnostics result for language refresh
 let activeDiagHighlight = null; // which highlight is showing: 'openEdges'|'nonManifold'|'shells'|'overlaps'|null
+const activeAnalysisOverlays = {
+  signedDisplacement: false,
+  triangleDensity: false,
+};
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 
@@ -927,6 +932,21 @@ function wireEvents() {
     meshDiagnostics.classList.add('hidden');
     clearDiagHighlight();
   });
+
+  if (diagSignedDispToggle) {
+    diagSignedDispToggle.addEventListener('change', () => {
+      activeAnalysisOverlays.signedDisplacement = diagSignedDispToggle.checked;
+      if (diagSignedDispToggle.checked) activeDiagHighlight = null;
+      refreshDiagOverlays();
+    });
+  }
+  if (diagTriDensityToggle) {
+    diagTriDensityToggle.addEventListener('change', () => {
+      activeAnalysisOverlays.triangleDensity = diagTriDensityToggle.checked;
+      if (diagTriDensityToggle.checked) activeDiagHighlight = null;
+      refreshDiagOverlays();
+    });
+  }
 
   // ── Support banner dismiss ──
   document.getElementById('store-cta-dismiss').addEventListener('click', () => {
@@ -2111,6 +2131,10 @@ async function handleModelFile(file) {
     meshDiagAdvanced.classList.add('hidden');
     lastFastDiag = null;
     lastAdvancedDiag = null;
+    activeAnalysisOverlays.signedDisplacement = false;
+    activeAnalysisOverlays.triangleDensity = false;
+    if (diagSignedDispToggle) diagSignedDispToggle.checked = false;
+    if (diagTriDensityToggle) diagTriDensityToggle.checked = false;
     clearDiagHighlight();
 
     // Reset exclusion state for the new mesh
@@ -2206,28 +2230,163 @@ function applyDiagSeverity() {
 }
 
 function clearDiagHighlight() {
-  clearDiagOverlays();
   activeDiagHighlight = null;
   // Reset all toggle buttons in the popup
   meshDiagnostics.querySelectorAll('.diag-show-btn').forEach(btn => {
     btn.textContent = t('diag.show');
   });
+  refreshDiagOverlays();
 }
 
-function toggleDiagHighlight(kind) {
-  if (activeDiagHighlight === kind) {
-    clearDiagHighlight();
-    return;
+function _buildSignedDisplacementOverlayGeo() {
+  if (!currentGeometry?.attributes?.position || !activeMapEntry?.imageData || !currentBounds) return null;
+  const srcPos = currentGeometry.attributes.position.array;
+  const srcNrm = currentGeometry.attributes.normal ? currentGeometry.attributes.normal.array : null;
+  const triVerts = currentGeometry.attributes.position.count;
+  if (!triVerts) return null;
+
+  const outPos = new Float32Array(srcPos);
+  const outNrm = srcNrm ? new Float32Array(srcNrm) : null;
+  const outCol = new Float32Array(triVerts * 3);
+  const tmpPos = new THREE.Vector3();
+  const tmpNrm = new THREE.Vector3();
+  const { imageData, width, height } = activeMapEntry;
+  const mapData = imageData.data;
+  const texMax = Math.max(width, height, 1);
+  const uvSettings = {
+    ...settings,
+    textureAspectU: texMax / Math.max(width, 1),
+    textureAspectV: texMax / Math.max(height, 1),
+  };
+
+  const maxAbsDisp = Math.max(Math.abs(settings.amplitude), 1e-6);
+  for (let i = 0; i < triVerts; i++) {
+    tmpPos.fromArray(srcPos, i * 3);
+    if (srcNrm) tmpNrm.fromArray(srcNrm, i * 3);
+    else tmpNrm.set(0, 0, 1);
+    const uv = computeUV(tmpPos, tmpNrm, settings.mappingMode, uvSettings, currentBounds);
+    let grey = 0;
+    if (uv.triplanar) {
+      for (const s of uv.samples) grey += _sampleBilinearGrey(mapData, width, height, s.u, s.v) * s.w;
+    } else {
+      grey = _sampleBilinearGrey(mapData, width, height, uv.u, uv.v);
+    }
+    const signedDisp = (settings.symmetricDisplacement ? (grey - 0.5) : grey) * settings.amplitude;
+    const signedNorm = THREE.MathUtils.clamp(signedDisp / maxAbsDisp, -1, 1);
+    const color = _signedHeatColor(signedNorm);
+    outCol[i * 3] = color.r;
+    outCol[i * 3 + 1] = color.g;
+    outCol[i * 3 + 2] = color.b;
   }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+  if (outNrm) geo.setAttribute('normal', new THREE.BufferAttribute(outNrm, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(outCol, 3));
+  return geo;
+}
+
+function _buildTriangleDensityOverlayGeo() {
+  if (!currentGeometry?.attributes?.position) return null;
+  const srcPos = currentGeometry.attributes.position.array;
+  const srcNrm = currentGeometry.attributes.normal ? currentGeometry.attributes.normal.array : null;
+  const triCount = srcPos.length / 9;
+  if (!triCount) return null;
+
+  const outPos = new Float32Array(srcPos);
+  const outNrm = srcNrm ? new Float32Array(srcNrm) : null;
+  const outCol = new Float32Array((srcPos.length / 3) * 3);
+  const areas = new Float32Array(triCount);
+  let minArea = Infinity;
+  let maxArea = 0;
+
+  for (let t = 0; t < triCount; t++) {
+    const b = t * 9;
+    const ax = srcPos[b], ay = srcPos[b + 1], az = srcPos[b + 2];
+    const bx = srcPos[b + 3], by = srcPos[b + 4], bz = srcPos[b + 5];
+    const cx = srcPos[b + 6], cy = srcPos[b + 7], cz = srcPos[b + 8];
+    const abx = bx - ax, aby = by - ay, abz = bz - az;
+    const acx = cx - ax, acy = cy - ay, acz = cz - az;
+    const crx = aby * acz - abz * acy;
+    const cry = abz * acx - abx * acz;
+    const crz = abx * acy - aby * acx;
+    const area = 0.5 * Math.sqrt(crx * crx + cry * cry + crz * crz);
+    areas[t] = area;
+    if (area < minArea) minArea = area;
+    if (area > maxArea) maxArea = area;
+  }
+
+  const safeMin = Math.max(minArea, 1e-12);
+  const safeMax = Math.max(maxArea, safeMin + 1e-12);
+  const logMin = Math.log(safeMin);
+  const logRange = Math.max(1e-12, Math.log(safeMax) - logMin);
+  for (let t = 0; t < triCount; t++) {
+    const risk = THREE.MathUtils.clamp((Math.log(Math.max(areas[t], 1e-12)) - logMin) / logRange, 0, 1);
+    const color = _signedHeatColor(risk * 2 - 1);
+    const vBase = t * 9;
+    for (let k = 0; k < 3; k++) {
+      const cIdx = vBase + k * 3;
+      outCol[cIdx] = color.r;
+      outCol[cIdx + 1] = color.g;
+      outCol[cIdx + 2] = color.b;
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(outPos, 3));
+  if (outNrm) geo.setAttribute('normal', new THREE.BufferAttribute(outNrm, 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(outCol, 3));
+  return geo;
+}
+
+function _sampleBilinearGrey(data, w, h, u, v) {
+  u = ((u % 1) + 1) % 1;
+  v = ((v % 1) + 1) % 1;
+  v = 1 - v;
+  const fx = u * (w - 1);
+  const fy = v * (h - 1);
+  const x0 = Math.floor(fx);
+  const y0 = Math.floor(fy);
+  const x1 = Math.min(x0 + 1, w - 1);
+  const y1 = Math.min(y0 + 1, h - 1);
+  const tx = fx - x0;
+  const ty = fy - y0;
+  const v00 = data[(y0 * w + x0) * 4] / 255;
+  const v10 = data[(y0 * w + x1) * 4] / 255;
+  const v01 = data[(y1 * w + x0) * 4] / 255;
+  const v11 = data[(y1 * w + x1) * 4] / 255;
+  return v00 * (1 - tx) * (1 - ty) + v10 * tx * (1 - ty) + v01 * (1 - tx) * ty + v11 * tx * ty;
+}
+
+function _signedHeatColor(normVal) {
+  const t = THREE.MathUtils.clamp(normVal, -1, 1);
+  const neutral = new THREE.Color(0xcbd5e1);
+  const cold = new THREE.Color(0x1d4ed8);
+  const hot = new THREE.Color(0xdc2626);
+  return t < 0 ? neutral.clone().lerp(cold, -t) : neutral.clone().lerp(hot, t);
+}
+
+function refreshDiagOverlays() {
   clearDiagOverlays();
-  activeDiagHighlight = kind;
 
   // Reset all buttons then mark the active one
   meshDiagnostics.querySelectorAll('.diag-show-btn').forEach(btn => {
-    btn.textContent = (btn.dataset.kind === kind) ? t('diag.hide') : t('diag.show');
+    btn.textContent = (btn.dataset.kind === activeDiagHighlight) ? t('diag.hide') : t('diag.show');
   });
 
   if (!currentGeometry) return;
+
+  if (activeAnalysisOverlays.signedDisplacement) {
+    const dispGeo = _buildSignedDisplacementOverlayGeo();
+    if (dispGeo) addDiagFaces(dispGeo, 0xffffff, 0.75, true, true);
+  }
+  if (activeAnalysisOverlays.triangleDensity) {
+    const densityGeo = _buildTriangleDensityOverlayGeo();
+    if (densityGeo) addDiagFaces(densityGeo, 0xffffff, 0.65, true, true);
+  }
+
+  const kind = activeDiagHighlight;
+  if (!kind) return;
 
   if (kind === 'openEdges' || kind === 'nonManifold') {
     const edgeData = getEdgePositions(currentGeometry);
@@ -2266,6 +2425,15 @@ function toggleDiagHighlight(kind) {
     const geo = buildExclusionOverlayGeo(currentGeometry, lastAdvancedDiag.overlapFaces);
     addDiagFaces(geo, 0xf59e0b, 0.7);
   }
+}
+
+function toggleDiagHighlight(kind) {
+  if (activeDiagHighlight === kind) {
+    clearDiagHighlight();
+    return;
+  }
+  activeDiagHighlight = kind;
+  refreshDiagOverlays();
 }
 
 /**
@@ -3103,6 +3271,9 @@ function updatePreview() {
   exportBtn.disabled = false;
   export3mfBtn.disabled = false;
   renderExportValidation();
+  if (activeAnalysisOverlays.signedDisplacement || activeAnalysisOverlays.triangleDensity || activeDiagHighlight) {
+    refreshDiagOverlays();
+  }
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
