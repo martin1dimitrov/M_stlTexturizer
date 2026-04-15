@@ -1,6 +1,7 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
 import { subdivide } from '../subdivision.js';
 import { applyDisplacement } from '../displacement.js';
+import { decimate } from '../decimation.js';
 
 function buildGeometry(position, normal, excludeWeight = null) {
   const geo = new THREE.BufferGeometry();
@@ -51,7 +52,7 @@ self.onmessage = async (e) => {
 
   let subdivided = null;
   let displaced = null;
-  const stageStats = { maxObservedMB: 0 };
+  let finalGeometry = null;
 
   try {
     const geometry = buildGeometry(msg.geometry.position, msg.geometry.normal, msg.geometry.excludeWeight);
@@ -94,29 +95,73 @@ self.onmessage = async (e) => {
     );
     observeStage(msg.debugStageStats, 'displacement', displaced, stageStats);
 
-    const outPos = displaced.attributes.position.array;
-    const outNrm = displaced.attributes.normal.array;
+    const dispTriCount = displaced.attributes.position.count / 3;
+    const maxTriangles = Number.isFinite(msg.maxTriangles) ? msg.maxTriangles : Infinity;
+    const needsDecimation = dispTriCount > maxTriangles;
+    let decimationFailed = false;
+
+    finalGeometry = displaced;
+    if (needsDecimation) {
+      self.postMessage({
+        type: 'progress',
+        phase: 'decimate',
+        fraction: 0,
+        triCount: dispTriCount,
+        targetTriangles: maxTriangles,
+      });
+      try {
+        finalGeometry = await decimate(
+          displaced,
+          maxTriangles,
+          (p) => {
+            self.postMessage({
+              type: 'progress',
+              phase: 'decimate',
+              fraction: p,
+              triCount: Math.round(dispTriCount - (dispTriCount - maxTriangles) * p),
+              targetTriangles: maxTriangles,
+            });
+          },
+          msg.decimationOptions
+        );
+      } catch (decErr) {
+        decimationFailed = true;
+        finalGeometry = displaced;
+        self.postMessage({
+          type: 'progress',
+          phase: 'decimate',
+          fraction: 1,
+          triCount: dispTriCount,
+          targetTriangles: maxTriangles,
+          failed: true,
+          message: decErr?.message || String(decErr),
+        });
+      }
+    }
+
+    const outPos = finalGeometry.attributes.position.array;
+    const outNrm = finalGeometry.attributes.normal.array;
 
     self.postMessage(
       {
         type: 'result',
         safetyCapHit: subdivResult.safetyCapHit,
-        maxObservedMB: stageStats.maxObservedMB,
+        decimationFailed,
         position: outPos,
         normal: outNrm,
       },
       [outPos.buffer, outNrm.buffer]
     );
 
-    releaseGeometryBuffers(geometry, 'input->subdivision', msg.debugStageStats);
-    releaseGeometryBuffers(subdivided, 'subdivision->displacement', msg.debugStageStats);
-    subdivided = null;
-    releaseGeometryBuffers(displaced, 'displacement->result', msg.debugStageStats);
-    displaced = null;
+    geometry.dispose();
+    subdivided.dispose();
+    displaced.dispose();
+    if (finalGeometry && finalGeometry !== displaced) finalGeometry.dispose();
   } catch (err) {
     self.postMessage({ type: 'error', message: err?.message || String(err) });
   } finally {
-    if (subdivided) releaseGeometryBuffers(subdivided, 'finally-subdivided', msg?.debugStageStats);
-    if (displaced) releaseGeometryBuffers(displaced, 'finally-displaced', msg?.debugStageStats);
+    if (subdivided) subdivided.dispose();
+    if (displaced) displaced.dispose();
+    if (finalGeometry && finalGeometry !== displaced) finalGeometry.dispose();
   }
 };
