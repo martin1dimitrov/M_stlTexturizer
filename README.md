@@ -57,6 +57,7 @@ Load an STL, OBJ, or 3MF file, pick a texture, tune the parameters, and export a
 - **Adaptive subdivision** — subdivides edges until they are ≤ a target length; respects sharp creases (>30° dihedral)
 - **QEM decimation** — simplifies the result to a target triangle count using Quadric Error Metrics with boundary protection, link-condition checks, normal-flip rejection, and crease preservation
 - **Safety cap** — hard limit of 10 M triangles during subdivision to prevent out-of-memory
+- **Worker offload (export path)** — subdivision + displacement run in a Web Worker when available to keep the UI responsive; automatic main-thread fallback if worker setup fails
 
 ### 3D Viewer
 - **Orbit / pan / zoom** controls
@@ -74,6 +75,7 @@ Load an STL, OBJ, or 3MF file, pick a texture, tune the parameters, and export a
 - Downloads a **binary STL** with displacement baked in
 - Progress reporting through subdivision → displacement → decimation → writing stages
 - Configurable edge-length threshold and output triangle limit
+- Optional **Vase Mode Safety Checks** that add stricter pre-export rules for Spiral/Vase workflows
 
 ### Other
 - **Light / Dark theme** — respects OS preference, persisted per browser
@@ -148,6 +150,8 @@ php -S localhost:8000
 Open http://localhost:8000 in your browser and you're ready to go.
 
 > **Tip:** Any static server will work — the app has no server-side dependencies.
+>
+> **Troubleshooting:** If you open `index.html` directly via `file://`, model/texture upload may appear to do nothing because browsers block ES module loading and file access in that mode. Always use a local HTTP server.
 
 ## Dependencies
 

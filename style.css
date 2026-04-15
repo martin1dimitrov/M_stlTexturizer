@@ -130,6 +130,21 @@ html, body {
   overflow: hidden;
 }
 
+#local-server-warning {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 10000;
+  padding: 10px 14px;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
+  color: #fff;
+  background: #c0392b;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.25);
+}
+
 /* ── Header ─────────────────────────────────────────────────────────── */
 header {
   height: var(--header-h);
@@ -510,6 +525,34 @@ main {
   word-break: break-all;
 }
 
+.texture-validation {
+  margin-top: 6px;
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font-size: 10px;
+  line-height: 1.35;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+}
+
+.texture-validation.hidden { display: none; }
+.texture-validation.ok {
+  border-color: var(--success);
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 10%, var(--surface2));
+}
+.texture-validation.warn {
+  border-color: #f59e0b;
+  color: #f59e0b;
+  background: color-mix(in srgb, #f59e0b 15%, var(--surface2));
+}
+.texture-validation.error {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface2));
+}
+
 /* ── Form rows ───────────────────────────────────────────────────────── */
 .form-row {
   display: flex;
@@ -738,6 +781,29 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 }
 
 .tri-limit-warning.hidden { display: none; }
+
+.export-validation {
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.45;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+}
+
+.export-validation.hidden { display: none; }
+.export-validation.has-errors {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface2));
+}
+.export-validation.has-warnings:not(.has-errors) {
+  border-color: #f59e0b;
+  color: #f59e0b;
+  background: color-mix(in srgb, #f59e0b 15%, var(--surface2));
+}
 
 /* ── Amplitude overlap warning ────────────────────────────────────────────────────────────── */
 .amplitude-warning {

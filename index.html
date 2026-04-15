@@ -131,6 +131,7 @@
         </label>
         <input type="file" id="texture-file-input" accept="image/*" hidden />
         <div id="active-map-name" class="active-map-name" data-i18n="ui.noMapSelected">No map selected</div>
+        <div id="texture-validation" class="texture-validation hidden"></div>
         <div class="form-row slider-row">
           <label for="texture-smoothing" data-i18n="labels.textureSmoothing" data-i18n-title="tooltips.textureSmoothing" title="Applies a Gaussian blur to the displacement map. Higher values produce softer, more gradual surface detail. 0 = off.">Texture Smoothing ⓘ</label>
           <input type="range" id="texture-smoothing" min="0" max="20" step="any" value="0" />
@@ -354,6 +355,22 @@
       <!-- Export -->
       <section class="panel-section">
         <h2 data-i18n="sections.export" data-i18n-title="tooltips.export" title="Smaller edge length = finer displacement detail. Output is then decimated to the triangle limit.">Export ⓘ</h2>
+        <div class="form-row">
+          <label for="export-preset">Export Preset</label>
+          <select id="export-preset">
+            <option value="balanced" selected>Balanced Print Export</option>
+            <option value="fast">Fast Preview Export</option>
+            <option value="high">High Detail Export</option>
+            <option value="vase">Vase Mode Safe Export</option>
+            <option value="large">Large Model Export</option>
+          </select>
+        </div>
+        <div class="form-row">
+          <label class="checkbox-label" for="vase-mode-safe" title="Applies extra pre-export checks intended for Spiral/Vase workflows.">
+            <input type="checkbox" id="vase-mode-safe" />
+            <span>Vase Mode Safety Checks</span>
+          </label>
+        </div>
         <div class="form-row slider-row">
           <label for="refine-length" data-i18n="labels.resolution" data-i18n-title="tooltips.resolution" title="Edges longer than this value will be split during export">Resolution (mm)</label>
           <input type="range" id="refine-length" min="0.01" max="2" step="0.01" value="1" />
@@ -370,6 +387,7 @@
         <div id="tri-limit-warning" class="tri-limit-warning hidden" data-i18n="warnings.safetyCapHit">
           ⚠ 20M-triangle safety cap hit during subdivision — result may still be coarser than requested edge length.
         </div>
+        <div id="export-validation" class="export-validation hidden"></div>
 
         <div id="export-progress" class="export-progress hidden">
           <div class="export-progress-track">
@@ -454,6 +472,28 @@
     </div>
   </div>
 
+  <script>
+    // Running directly from file:// breaks module imports and file loading in most browsers.
+    (function () {
+      if (location.protocol !== 'file:') return;
+      const warningText = 'BumpMesh cannot run reliably from file://. Start a local server (e.g. "python -m http.server 8000"), then open http://localhost:8000';
+      window.addEventListener('DOMContentLoaded', () => {
+        const banner = document.createElement('div');
+        banner.id = 'local-server-warning';
+        banner.textContent = warningText;
+        document.body.prepend(banner);
+
+        const wireInputWarning = (id) => {
+          const input = document.getElementById(id);
+          if (!input) return;
+          input.addEventListener('click', () => alert(warningText));
+          input.addEventListener('change', () => alert(warningText));
+        };
+        wireInputWarning('stl-file-input');
+        wireInputWarning('texture-file-input');
+      });
+    })();
+  </script>
   <script type="module" src="js/main.js"></script>
 </body>
 </html>

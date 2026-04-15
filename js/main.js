@@ -53,6 +53,7 @@ let _shiftLineMesh     = null;        // THREE.Line — preview line from last p
 let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
+let exportWorker          = null;
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
 let _spatialGrid = null;
@@ -79,6 +80,7 @@ const settings = {
   boundaryFalloff:  0,
   symmetricDisplacement: false,
   useDisplacement: false,
+  vaseModeSafe: false,
 };
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
@@ -190,13 +192,17 @@ const stlFileInput   = document.getElementById('stl-file-input');
 const textureInput   = document.getElementById('texture-file-input');
 const presetGrid     = document.getElementById('preset-grid');
 const activeMapName  = document.getElementById('active-map-name');
+const textureValidationEl = document.getElementById('texture-validation');
 const meshInfo       = document.getElementById('mesh-info');
 const exportBtn        = document.getElementById('export-btn');
 const export3mfBtn     = document.getElementById('export-3mf-btn');
+const exportPresetSelect = document.getElementById('export-preset');
 const exportProgress   = document.getElementById('export-progress');
 const exportProgBar    = document.getElementById('export-progress-bar');
 const exportProgPct    = document.getElementById('export-progress-pct');
 const exportProgLbl    = document.getElementById('export-progress-label');
+const exportValidationEl = document.getElementById('export-validation');
+const vaseModeSafeToggle = document.getElementById('vase-mode-safe');
 const triLimitWarning  = document.getElementById('tri-limit-warning');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
@@ -459,6 +465,207 @@ function resetTextureSmoothing() {
   textureSmoothingVal.value    = 0;
 }
 
+function _quantileFromHist(hist, q, total) {
+  const target = Math.max(0, Math.min(total - 1, Math.floor(q * (total - 1))));
+  let acc = 0;
+  for (let i = 0; i < 256; i++) {
+    acc += hist[i];
+    if (acc > target) return i / 255;
+  }
+  return 1;
+}
+
+function analyzeTextureQuality(entry) {
+  const { imageData, width, height } = entry;
+  const data = imageData.data;
+  const pxCount = width * height;
+  const hist = new Uint32Array(256);
+  let sumL = 0;
+  let sumL2 = 0;
+  let colorDiffSum = 0;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const l = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    hist[l]++;
+    sumL += l;
+    sumL2 += l * l;
+    colorDiffSum += (Math.abs(r - g) + Math.abs(g - b) + Math.abs(b - r)) / (3 * 255);
+  }
+
+  const mean = sumL / pxCount;
+  const variance = Math.max(0, sumL2 / pxCount - mean * mean);
+  const stdNorm = Math.sqrt(variance) / 255;
+  const p01 = _quantileFromHist(hist, 0.01, pxCount);
+  const p99 = _quantileFromHist(hist, 0.99, pxCount);
+  const dynamicRange = Math.max(0, p99 - p01);
+  const clipLow = hist[0] / pxCount;
+  const clipHigh = hist[255] / pxCount;
+
+  let seamAcc = 0;
+  for (let y = 0; y < height; y++) {
+    const lOff = (y * width) * 4;
+    const rOff = (y * width + (width - 1)) * 4;
+    seamAcc += Math.abs(data[lOff] - data[rOff]);
+  }
+  for (let x = 0; x < width; x++) {
+    const tOff = x * 4;
+    const bOff = ((height - 1) * width + x) * 4;
+    seamAcc += Math.abs(data[tOff] - data[bOff]);
+  }
+  const seamScore = seamAcc / ((width + height) * 255);
+
+  return {
+    grayscaleDeviation: colorDiffSum / pxCount,
+    histogramStd: stdNorm,
+    dynamicRange,
+    clipLow,
+    clipHigh,
+    seamScore,
+  };
+}
+
+function validateTextureEntry(entry) {
+  if (entry._validation) return entry._validation;
+  const metrics = analyzeTextureQuality(entry);
+  const issues = [];
+
+  if (metrics.grayscaleDeviation > 0.12) {
+    issues.push({ level: 'error', message: 'Texture appears to be strongly colored; use a grayscale displacement map.' });
+  } else if (metrics.grayscaleDeviation > 0.03) {
+    issues.push({ level: 'warn', message: 'Texture is not purely grayscale. Converting to grayscale is recommended.' });
+  }
+
+  if (metrics.dynamicRange < 0.10 || metrics.histogramStd < 0.10) {
+    issues.push({ level: 'warn', message: 'Low contrast histogram; displacement may look flat.' });
+  }
+
+  if (metrics.clipLow + metrics.clipHigh > 0.20) {
+    issues.push({ level: 'warn', message: 'Histogram clipping detected; details may crush at min/max height.' });
+  }
+
+  if (metrics.seamScore > 0.12) {
+    issues.push({ level: 'warn', message: 'High seam mismatch score; tiling seams may be visible.' });
+  }
+
+  const severity = issues.some(i => i.level === 'error')
+    ? 'error'
+    : issues.some(i => i.level === 'warn')
+      ? 'warn'
+      : 'ok';
+
+  const result = { metrics, issues, severity };
+  entry._validation = result;
+  return result;
+}
+
+function renderTextureValidation(validation) {
+  if (!textureValidationEl) return;
+  textureValidationEl.classList.remove('hidden', 'ok', 'warn', 'error');
+  textureValidationEl.classList.add(validation.severity);
+  const m = validation.metrics;
+  const headline = validation.severity === 'ok'
+    ? '✓ Texture quality check passed.'
+    : validation.severity === 'warn'
+      ? '⚠ Texture quality warnings.'
+      : '⛔ Texture rejected.';
+  const metricLine = `Gray Δ ${m.grayscaleDeviation.toFixed(3)} · Range ${m.dynamicRange.toFixed(2)} · Seam ${m.seamScore.toFixed(2)}`;
+  const issueLine = validation.issues.length
+    ? validation.issues.map(i => `• ${i.message}`).join('<br/>')
+    : '• Ready for displacement.';
+  textureValidationEl.innerHTML = `${headline}<br/>${metricLine}<br/>${issueLine}`;
+}
+
+function clearTextureValidation() {
+  if (!textureValidationEl) return;
+  textureValidationEl.className = 'texture-validation hidden';
+  textureValidationEl.textContent = '';
+}
+
+function collectExportValidation() {
+  const errors = [];
+  const warnings = [];
+
+  if (!currentGeometry) errors.push('Load a model before exporting.');
+  if (!activeMapEntry) errors.push('Select or upload a displacement map before exporting.');
+
+  if (currentBounds) {
+    const minDim = Math.min(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
+    if (Math.abs(settings.amplitude) > minDim * 0.1) {
+      warnings.push('Amplitude is high relative to model size; self-intersections may occur.');
+    }
+    const diag = Math.sqrt(currentBounds.size.x ** 2 + currentBounds.size.y ** 2 + currentBounds.size.z ** 2);
+    if (settings.refineLength > diag / 100) {
+      warnings.push('Resolution is coarse for this model; fine texture detail may be lost.');
+    }
+  }
+
+  if (lastFastDiag) {
+    if (lastFastDiag.openEdges > 0) errors.push(`Mesh has ${lastFastDiag.openEdges.toLocaleString()} open edge(s).`);
+    if (lastFastDiag.nonManifoldEdges > 0) errors.push(`Mesh has ${lastFastDiag.nonManifoldEdges.toLocaleString()} non-manifold edge(s).`);
+    if (lastFastDiag.shellCount > 1) warnings.push(`Mesh contains ${lastFastDiag.shellCount.toLocaleString()} separate shells.`);
+  }
+  if (lastAdvancedDiag) {
+    if (lastAdvancedDiag.intersectingPairs > 0) errors.push(`Mesh has ${lastAdvancedDiag.intersectingPairs.toLocaleString()} intersecting triangle pair(s).`);
+    if (lastAdvancedDiag.overlappingPairs > 0) warnings.push(`Mesh has ${lastAdvancedDiag.overlappingPairs.toLocaleString()} overlapping triangle pair(s).`);
+  }
+
+  if (settings.maxTriangles < 150_000) {
+    warnings.push('Output triangle limit is low; visible faceting is likely.');
+  }
+
+  if (settings.vaseModeSafe) {
+    if (settings.mappingMode !== 3) {
+      warnings.push('Vase Mode Safety works best with Cylindrical projection.');
+    }
+    if (settings.amplitude < 0) {
+      errors.push('Negative amplitude is blocked in Vase Mode Safety to avoid inward contour reversals.');
+    }
+    if (currentBounds) {
+      const minDim = Math.min(currentBounds.size.x, currentBounds.size.y, currentBounds.size.z);
+      if (Math.abs(settings.amplitude) > minDim * 0.05) {
+        errors.push('Amplitude exceeds 5% of the smallest model dimension in Vase Mode Safety.');
+      }
+    }
+    const v = activeMapEntry?._validation;
+    if (v?.metrics?.seamScore > 0.18) {
+      errors.push('Texture seam score is too high for Vase Mode Safety.');
+    } else if (v?.metrics?.seamScore > 0.10) {
+      warnings.push('Texture seam score is elevated; visible seam risk in vase prints.');
+    }
+  }
+
+  return { errors, warnings };
+}
+
+function renderExportValidation() {
+  if (!exportValidationEl) return { errors: [], warnings: [] };
+  const { errors, warnings } = collectExportValidation();
+  exportValidationEl.classList.remove('hidden', 'has-errors', 'has-warnings');
+
+  if (errors.length === 0 && warnings.length === 0) {
+    exportValidationEl.classList.add('hidden');
+    exportValidationEl.textContent = '';
+    return { errors, warnings };
+  }
+
+  if (errors.length) exportValidationEl.classList.add('has-errors');
+  else exportValidationEl.classList.add('has-warnings');
+
+  const lines = [];
+  if (errors.length) {
+    lines.push('<strong>Export blocked:</strong>');
+    for (const err of errors) lines.push(`• ${err}`);
+  }
+  if (warnings.length) {
+    if (errors.length) lines.push('<br/><strong>Warnings:</strong>');
+    else lines.push('<strong>Warnings:</strong>');
+    for (const warn of warnings) lines.push(`• ${warn}`);
+  }
+  exportValidationEl.innerHTML = lines.join('<br/>');
+  return { errors, warnings };
+}
+
 let _selectGeneration = 0;   // debounce rapid preset clicks
 
 async function selectPreset(idx, swatchEl) {
@@ -474,6 +681,9 @@ async function selectPreset(idx, swatchEl) {
 
   // If full texture is already loaded, use it directly
   if (entry.texture) {
+    const validation = validateTextureEntry(entry);
+    renderTextureValidation(validation);
+    if (validation.severity === 'error') return;
     activeMapEntry = entry;
     updatePreview();
     return;
@@ -485,6 +695,13 @@ async function selectPreset(idx, swatchEl) {
     const full = await loadFullPreset(idx);
     if (gen !== _selectGeneration) return;   // user clicked another preset meanwhile
     PRESETS[idx] = { ...entry, ...full };
+    const validation = validateTextureEntry(PRESETS[idx]);
+    renderTextureValidation(validation);
+    if (validation.severity === 'error') {
+      swatchEl.classList.remove('active');
+      swatchEl.classList.remove('preset-loading-full');
+      return;
+    }
     activeMapEntry = PRESETS[idx];
     swatchEl.classList.remove('preset-loading-full');
     updatePreview();
@@ -580,7 +797,15 @@ function wireEvents() {
     const file = e.target.files[0];
     if (!file) return;
     try {
-      activeMapEntry = await loadCustomTexture(file);
+      const candidate = await loadCustomTexture(file);
+      const validation = validateTextureEntry(candidate);
+      renderTextureValidation(validation);
+      if (validation.severity === 'error') {
+        alert(validation.issues.map(i => i.message).join('\n'));
+        textureInput.value = '';
+        return;
+      }
+      activeMapEntry = candidate;
       activeMapEntry.isCustom = true;
       activeMapName.textContent = file.name;
       document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
@@ -687,7 +912,24 @@ function wireEvents() {
   });
 
   // ── Export ──
+  if (exportPresetSelect) {
+    exportPresetSelect.addEventListener('change', () => {
+      applyExportPreset(exportPresetSelect.value);
+    });
+  }
+  if (vaseModeSafeToggle) {
+    vaseModeSafeToggle.addEventListener('change', () => {
+      settings.vaseModeSafe = vaseModeSafeToggle.checked;
+      renderExportValidation();
+    });
+  }
+
   const startExport = (format) => {
+    const validation = renderExportValidation();
+    if (validation.errors.length) {
+      alert(validation.errors.join('\n'));
+      return;
+    }
     if (sessionStorage.getItem('stlt-no-sponsor') === '1') {
       handleExport(format);
       return;
@@ -1575,6 +1817,13 @@ function updateBucketHover(e) {
 // ── Slider helper ─────────────────────────────────────────────────────────────
 
 const INPUT_WHEEL_DECIMALS = 3;
+const EXPORT_PRESETS = {
+  fast:     { refineLength: 1.5, maxTriangles: 300_000 },
+  balanced: { refineLength: 1.0, maxTriangles: 750_000 },
+  high:     { refineLength: 0.35, maxTriangles: 2_000_000 },
+  vase:     { refineLength: 0.45, maxTriangles: 1_200_000 },
+  large:    { refineLength: 1.6, maxTriangles: 500_000 },
+};
 
 function getInputPrecision(input) {
   const configured = parseInt(input.dataset.wheelDecimals, 10);
@@ -1638,6 +1887,22 @@ function addFineWheelSupport(input, applyFn) {
 
     applyFn(next);
   }, { passive: false });
+}
+
+function applyExportPreset(presetKey) {
+  const preset = EXPORT_PRESETS[presetKey];
+  if (!preset) return;
+  settings.refineLength = preset.refineLength;
+  settings.maxTriangles = preset.maxTriangles;
+  settings.vaseModeSafe = presetKey === 'vase';
+  refineLenSlider.value = preset.refineLength;
+  refineLenVal.value = formatInputValue(refineLenVal, preset.refineLength);
+  maxTriSlider.value = preset.maxTriangles;
+  maxTriVal.textContent = formatM(preset.maxTriangles);
+  if (vaseModeSafeToggle) vaseModeSafeToggle.checked = settings.vaseModeSafe;
+  checkResolutionWarning();
+  clearTimeout(previewDebounce);
+  previewDebounce = setTimeout(updatePreview, 80);
 }
 
 function linkSlider(slider, valInput, onChangeFn, livePreview = true) {
@@ -2045,6 +2310,7 @@ function renderAdvancedDiag(results) {
     meshDiagAdvanced.appendChild(tip);
   }
   applyDiagSeverity();
+  renderExportValidation();
 }
 
 function updateMeshDiagnostics(adjData, triCount) {
@@ -2056,6 +2322,7 @@ function updateMeshDiagnostics(adjData, triCount) {
   meshDiagnostics.classList.remove('hidden');
   meshDiagAdvanced.classList.add('hidden');
   meshDiagRunBtn.disabled = false;
+  renderExportValidation();
 }
 
 function checkResolutionWarning() {
@@ -2675,6 +2942,7 @@ function updatePreview() {
     }
     exportBtn.disabled = true;
     export3mfBtn.disabled = true;
+    clearTextureValidation();
     return;
   }
 
@@ -2700,6 +2968,7 @@ function updatePreview() {
   syncBoundaryEdgeUniforms();
   exportBtn.disabled = false;
   export3mfBtn.disabled = false;
+  renderExportValidation();
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
@@ -3199,38 +3468,44 @@ async function handleExport(format = 'stl') {
       ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
       : null;
 
-    let safetyCapHit;
-    ({ geometry: subdivided, safetyCapHit } = await subdivide(
-      currentGeometry, settings.refineLength,
-      (p, triCount, longestEdge) => {
-        const label = triCount != null
-          ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
-          : t('progress.subdividing');
-        setProgress(0.02 + p * 0.35, label);
-      },
-      faceWeights
-    ));
-    if (exportToken !== myToken) return;
-
-    const subTriCount = subdivided.attributes.position.count / 3;
-    setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
-
     const exportEntry = getEffectiveMapEntry();
-    displaced = await runAsync(() =>
-      applyDisplacement(
-        subdivided,
-        exportEntry.imageData,
-        exportEntry.width,
-        exportEntry.height,
-        settings,
-        currentBounds,
-        (p) => setProgress(0.38 + p * 0.32, t('progress.displacingVertices'))
-      )
-    );
-    if (exportToken !== myToken) return;
+    let safetyCapHit = false;
+    try {
+      ({ geometry: displaced, safetyCapHit } = await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+    } catch (workerErr) {
+      console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
+      ({ geometry: subdivided, safetyCapHit } = await subdivide(
+        currentGeometry, settings.refineLength,
+        (p, triCount, longestEdge) => {
+          const label = triCount != null
+            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setProgress(0.02 + p * 0.35, label);
+        },
+        faceWeights
+      ));
+      if (exportToken !== myToken) return;
 
-    // Free subdivided geometry — displacement created a separate copy
-    subdivided.dispose();
+      const subTriCount = subdivided.attributes.position.count / 3;
+      setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
+
+      displaced = await runAsync(() =>
+        applyDisplacement(
+          subdivided,
+          exportEntry.imageData,
+          exportEntry.width,
+          exportEntry.height,
+          settings,
+          currentBounds,
+          (p) => setProgress(0.38 + p * 0.32, t('progress.displacingVertices'))
+        )
+      );
+      if (exportToken !== myToken) return;
+
+      // Free subdivided geometry — displacement created a separate copy
+      subdivided.dispose();
+    }
+    if (exportToken !== myToken) return;
 
     const dispTriCount = displaced.attributes.position.count / 3;
     const needsDecimation = dispTriCount > settings.maxTriangles;
@@ -3354,4 +3629,88 @@ function runAsync(fn) {
 /** Yield to the browser event loop (for progress bar paints etc.). */
 function yieldFrame() {
   return new Promise(r => setTimeout(r, 0));
+}
+
+function _ensureExportWorker() {
+  if (exportWorker) return exportWorker;
+  exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  return exportWorker;
+}
+
+async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
+  if (typeof Worker === 'undefined') {
+    throw new Error('Web Workers are not available in this browser.');
+  }
+
+  const worker = _ensureExportWorker();
+  const pos = currentGeometry.attributes.position.array;
+  const nrm = currentGeometry.attributes.normal.array;
+  const posCopy = new Float32Array(pos);
+  const nrmCopy = new Float32Array(nrm);
+  const texCopy = new Uint8ClampedArray(exportEntry.imageData.data);
+  const exwCopy = faceWeights ? new Float32Array(faceWeights) : null;
+
+  const payload = {
+    type: 'run',
+    geometry: {
+      position: posCopy,
+      normal: nrmCopy,
+      excludeWeight: exwCopy,
+    },
+    texture: {
+      data: texCopy,
+      width: exportEntry.width,
+      height: exportEntry.height,
+    },
+    refineLength: settings.refineLength,
+    settings: { ...settings },
+    bounds: {
+      min: { x: currentBounds.min.x, y: currentBounds.min.y, z: currentBounds.min.z },
+      max: { x: currentBounds.max.x, y: currentBounds.max.y, z: currentBounds.max.z },
+      size: { x: currentBounds.size.x, y: currentBounds.size.y, z: currentBounds.size.z },
+      center: { x: currentBounds.center.x, y: currentBounds.center.y, z: currentBounds.center.z },
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const onMessage = (evt) => {
+      if (exportToken !== myToken) {
+        worker.removeEventListener('message', onMessage);
+        reject(new Error('Stale export worker result'));
+        return;
+      }
+      const data = evt.data;
+      if (!data) return;
+      if (data.type === 'progress') {
+        if (data.phase === 'subdivide') {
+          const label = data.triCount != null
+            ? t('progress.refining', { cur: data.triCount.toLocaleString(), edge: data.longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setProgress(0.02 + (data.fraction ?? 0) * 0.35, label);
+        } else if (data.phase === 'displace') {
+          setProgress(0.38 + (data.fraction ?? 0) * 0.32, t('progress.displacingVertices'));
+        }
+        return;
+      }
+      if (data.type === 'result') {
+        worker.removeEventListener('message', onMessage);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
+        resolve({ geometry: geo, safetyCapHit: !!data.safetyCapHit });
+        return;
+      }
+      if (data.type === 'error') {
+        worker.removeEventListener('message', onMessage);
+        reject(new Error(data.message || 'Worker processing failed'));
+      }
+    };
+    worker.addEventListener('message', onMessage);
+    worker.postMessage(payload, [
+      payload.geometry.position.buffer,
+      payload.geometry.normal.buffer,
+      payload.texture.data.buffer,
+      ...(payload.geometry.excludeWeight ? [payload.geometry.excludeWeight.buffer] : []),
+    ]);
+  });
 }
