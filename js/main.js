@@ -3,10 +3,12 @@ import { initViewer, loadGeometry, setMeshMaterial, setMeshGeometry, setWirefram
          getControls, getCamera, getCurrentMesh,
          setExclusionOverlay, setHoverPreview, setViewerTheme,
          setProjection, requestRender,
-         clearDiagOverlays, setDiagEdges, addDiagFaces } from './viewer.js';
+         clearDiagOverlays, setDiagEdges, addDiagFaces,
+         setFaceScalarOverlay, setSplitView } from './viewer.js';
 import { loadModelFile, computeBounds, getTriangleCount }  from './stlLoader.js';
 import { loadAllThumbnails, loadFullPreset, loadCustomTexture, IMAGE_PRESETS }  from './presetTextures.js';
 import { createPreviewMaterial, updateMaterial } from './previewMaterial.js';
+import { computeUV } from './mapping.js';
 import { subdivide }          from './subdivision.js';
 import { applyDisplacement }  from './displacement.js';
 import { decimate }           from './decimation.js';
@@ -54,6 +56,8 @@ let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
 let exportWorker          = null;
+let overlayMode           = 'none';
+let splitViewEnabled      = false;
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
 let _spatialGrid = null;
@@ -206,6 +210,8 @@ const vaseModeSafeToggle = document.getElementById('vase-mode-safe');
 const triLimitWarning  = document.getElementById('tri-limit-warning');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
+const overlayModeSelect = document.getElementById('overlay-mode');
+const splitViewToggle   = document.getElementById('split-view-toggle');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
 
 const mappingSelect   = document.getElementById('mapping-mode');
@@ -870,6 +876,18 @@ function wireEvents() {
 
   // ── Projection toggle ──
   projectionToggle.addEventListener('change', () => setProjection(projectionToggle.checked));
+  if (overlayModeSelect) {
+    overlayModeSelect.addEventListener('change', () => {
+      overlayMode = overlayModeSelect.value;
+      updatePreview();
+    });
+  }
+  if (splitViewToggle) {
+    splitViewToggle.addEventListener('change', () => {
+      splitViewEnabled = splitViewToggle.checked;
+      updatePreview();
+    });
+  }
 
   // ── Exclusion tool wiring ─────────────────────────────────────────────────
 
@@ -2944,6 +2962,124 @@ function getEffectiveMapEntry() {
   return _effectiveMapCache;
 }
 
+function _wrapDelta(a, b) {
+  const d = Math.abs(a - b);
+  return Math.min(d, 1 - d);
+}
+
+function _sampleLumaAtUV(imageData, width, height, u, v) {
+  if (!imageData || !imageData.data || width <= 0 || height <= 0) return 0.5;
+  const uu = ((u % 1) + 1) % 1;
+  const vv = ((v % 1) + 1) % 1;
+  const x = Math.min(width - 1, Math.max(0, Math.floor(uu * (width - 1))));
+  const y = Math.min(height - 1, Math.max(0, Math.floor((1 - vv) * (height - 1))));
+  const off = (y * width + x) * 4;
+  const d = imageData.data;
+  return (0.299 * d[off] + 0.587 * d[off + 1] + 0.114 * d[off + 2]) / 255;
+}
+
+function computeFaceStressScores(geometry, mapEntry, mapSettings) {
+  const posAttr = geometry?.getAttribute('position');
+  if (!posAttr) return { seamRisk: null, maskStress: null };
+  const pos = posAttr.array;
+  const triCount = Math.floor(posAttr.count / 3);
+  const seamRisk = new Float32Array(triCount);
+  const maskStress = new Float32Array(triCount);
+  const faceMaskAttr = geometry.getAttribute('faceMask');
+  const faceMask = faceMaskAttr?.array || null;
+  const faceNormalAttr = geometry.getAttribute('faceNormal');
+
+  const v0 = new THREE.Vector3(), v1 = new THREE.Vector3(), v2 = new THREE.Vector3();
+  const n = new THREE.Vector3(), e1 = new THREE.Vector3(), e2 = new THREE.Vector3();
+  const uv0 = { u: 0, v: 0 }, uv1 = { u: 0, v: 0 }, uv2 = { u: 0, v: 0 };
+  const centroid = new THREE.Vector3();
+
+  const uvFromMapping = (p, normal, out) => {
+    const uv = computeUV(p, normal, settings.mappingMode, mapSettings, currentBounds);
+    if (uv?.triplanar && uv.samples?.length) {
+      let wu = 0, wv = 0, ww = 0;
+      for (const s of uv.samples) {
+        const w = s.w ?? 0;
+        wu += (s.u ?? 0) * w;
+        wv += (s.v ?? 0) * w;
+        ww += w;
+      }
+      out.u = ww > 1e-6 ? wu / ww : 0;
+      out.v = ww > 1e-6 ? wv / ww : 0;
+      return;
+    }
+    out.u = uv?.u ?? 0;
+    out.v = uv?.v ?? 0;
+  };
+
+  const du = 1 / Math.max(64, mapEntry?.width || 64);
+  const dv = 1 / Math.max(64, mapEntry?.height || 64);
+
+  for (let t = 0; t < triCount; t++) {
+    const off = t * 9;
+    v0.set(pos[off], pos[off + 1], pos[off + 2]);
+    v1.set(pos[off + 3], pos[off + 4], pos[off + 5]);
+    v2.set(pos[off + 6], pos[off + 7], pos[off + 8]);
+    if (faceNormalAttr) {
+      const no = t * 9;
+      n.set(faceNormalAttr.array[no], faceNormalAttr.array[no + 1], faceNormalAttr.array[no + 2]).normalize();
+    } else {
+      e1.subVectors(v1, v0);
+      e2.subVectors(v2, v0);
+      n.crossVectors(e1, e2).normalize();
+    }
+
+    uvFromMapping(v0, n, uv0);
+    uvFromMapping(v1, n, uv1);
+    uvFromMapping(v2, n, uv2);
+
+    const d01 = Math.hypot(_wrapDelta(uv0.u, uv1.u), _wrapDelta(uv0.v, uv1.v));
+    const d12 = Math.hypot(_wrapDelta(uv1.u, uv2.u), _wrapDelta(uv1.v, uv2.v));
+    const d20 = Math.hypot(_wrapDelta(uv2.u, uv0.u), _wrapDelta(uv2.v, uv0.v));
+    seamRisk[t] = Math.min(1, Math.max(d01, d12, d20) / 0.35);
+
+    const m0 = faceMask ? faceMask[t * 3] : 1;
+    const m1 = faceMask ? faceMask[t * 3 + 1] : m0;
+    const m2 = faceMask ? faceMask[t * 3 + 2] : m0;
+    const maskGrad = Math.max(m0, m1, m2) - Math.min(m0, m1, m2);
+
+    centroid.copy(v0).add(v1).add(v2).multiplyScalar(1 / 3);
+    const cuv = { u: 0, v: 0 };
+    uvFromMapping(centroid, n, cuv);
+    const l = _sampleLumaAtUV(mapEntry?.imageData, mapEntry?.width || 1, mapEntry?.height || 1, cuv.u, cuv.v);
+    const lx = _sampleLumaAtUV(mapEntry?.imageData, mapEntry?.width || 1, mapEntry?.height || 1, cuv.u + du, cuv.v);
+    const ly = _sampleLumaAtUV(mapEntry?.imageData, mapEntry?.width || 1, mapEntry?.height || 1, cuv.u, cuv.v + dv);
+    const texGrad = Math.min(1, Math.hypot(lx - l, ly - l) * 12);
+    maskStress[t] = Math.min(1, maskGrad * 0.65 + texGrad * 0.35);
+  }
+  return { seamRisk, maskStress };
+}
+
+function updateOverlayAndSplit(activeGeo, effectiveEntry, fullSettings) {
+  const rightGeo = (settings.useDisplacement && dispPreviewGeometry) ? dispPreviewGeometry : activeGeo;
+  const leftGeo = currentGeometry || activeGeo;
+
+  const activeScores = computeFaceStressScores(activeGeo, effectiveEntry, fullSettings);
+  const leftScores = splitViewEnabled ? computeFaceStressScores(leftGeo, effectiveEntry, fullSettings) : null;
+  const rightScores = splitViewEnabled ? computeFaceStressScores(rightGeo, effectiveEntry, fullSettings) : null;
+
+  const pick = (scores) => {
+    if (!scores || overlayMode === 'none') return null;
+    if (overlayMode === 'seam-risk') return scores.seamRisk;
+    if (overlayMode === 'mask-stress') return scores.maskStress;
+    return null;
+  };
+
+  setFaceScalarOverlay({
+    mode: overlayMode,
+    geometry: activeGeo,
+    scores: pick(activeScores),
+    splitLeft: splitViewEnabled ? { geometry: leftGeo, scores: pick(leftScores) } : null,
+    splitRight: splitViewEnabled ? { geometry: rightGeo, scores: pick(rightScores) } : null,
+  });
+  setSplitView(splitViewEnabled, leftGeo, rightGeo);
+}
+
 function updatePreview() {
   if (!currentGeometry || !currentBounds) return;
 
@@ -2991,6 +3127,8 @@ function updatePreview() {
   } else {
     updateMaterial(previewMaterial, effectiveEntry.texture, fullSettings);
   }
+
+  updateOverlayAndSplit(activeGeo, effectiveEntry, fullSettings);
 
   syncBoundaryEdgeUniforms();
   exportBtn.disabled = false;
