@@ -54,6 +54,7 @@ let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
 let exportWorker          = null;
+const EXPORT_STAGE_DEBUG = /\bexportStageDebug=1\b/.test(window.location.search);
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
 let _spatialGrid = null;
@@ -3586,6 +3587,7 @@ async function handleExport(format = 'stl') {
   let displaced       = null;
   let finalGeometry   = null;
   let exportSucceeded = false; // set true only after exportSTL so finally can clean up on abort/error
+  const stageStats = { maxObservedMB: 0 };
 
   try {
     setProgress(0.02, t('progress.subdividing'));
@@ -3637,8 +3639,10 @@ async function handleExport(format = 'stl') {
       );
       if (exportToken !== myToken) return;
 
-      // Free subdivided geometry — displacement created a separate copy
-      subdivided.dispose();
+      // Free subdivided geometry immediately after handoff to displacement stage.
+      releaseGeometryBuffers(subdivided, 'subdivision->displacement');
+      subdivided = null;
+      observeExportStage('displacement', displaced, stageStats);
     }
     if (exportToken !== myToken) return;
 
@@ -3666,9 +3670,13 @@ async function handleExport(format = 'stl') {
           }
         )
       );
-      // Free pre-decimation geometry — decimate created a separate copy
-      displaced.dispose();
+      observeExportStage('decimation', finalGeometry, stageStats);
+      // Free pre-decimation geometry immediately after handoff to decimation output.
+      releaseGeometryBuffers(displaced, 'displacement->decimation');
+      displaced = null;
 	  if (exportToken !== myToken) return;
+    } else {
+      observeExportStage('decimation-skipped', finalGeometry, stageStats);
     }
 
     // Flat-bottom clamp: when bottom faces are masked (bottomAngleLimit > 0),
@@ -3709,16 +3717,33 @@ async function handleExport(format = 'stl') {
       setProgress(0.97, t('progress.writing3mf'));
       await yieldFrame();
       if (exportToken !== myToken) return;
+      observeExportStage('write-3mf', finalGeometry, stageStats);
       export3MF(finalGeometry, `${baseName}.3mf`);
     } else {
       setProgress(0.97, t('progress.writingStl'));
       await yieldFrame();
       if (exportToken !== myToken) return;
+      observeExportStage('write-stl', finalGeometry, stageStats);
       exportSTL(finalGeometry, `${baseName}.stl`);
     }
+    releaseGeometryBuffers(finalGeometry, 'write-complete');
+    finalGeometry = null;
     exportSucceeded = true;
 
-    setProgress(1.0, t('progress.done'));
+    const doneLabel = EXPORT_STAGE_DEBUG && stageStats.maxObservedMB > 0
+      ? `${t('progress.done')} · max ~${stageStats.maxObservedMB.toFixed(1)} MB`
+      : t('progress.done');
+    setProgress(1.0, doneLabel);
+    if (EXPORT_STAGE_DEBUG && stageStats.maxObservedMB > 0) {
+      console.info(
+        `[export][summary] max-observed-buffer-estimate=${stageStats.maxObservedMB.toFixed(2)} MB`
+      );
+      if (stageStats.maxObservedMB > 512) {
+        console.warn(
+          `[export][warning] high peak stage estimate (${stageStats.maxObservedMB.toFixed(2)} MB)`
+        );
+      }
+    }
     setTimeout(() => {
       exportProgress.classList.add('hidden');
       setProgress(0, '');
@@ -3733,9 +3758,11 @@ async function handleExport(format = 'stl') {
   } finally {
     // Dispose all intermediate geometries regardless of success, failure, or abort.
     // finalGeometry may alias displaced (no decimation) — avoid double-dispose.
-    if (subdivided) subdivided.dispose();
-    if (displaced && displaced !== subdivided) displaced.dispose();
-    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) finalGeometry.dispose();
+    if (subdivided) releaseGeometryBuffers(subdivided, 'finally-subdivided');
+    if (displaced && displaced !== subdivided) releaseGeometryBuffers(displaced, 'finally-displaced');
+    if (finalGeometry && finalGeometry !== displaced && finalGeometry !== subdivided) {
+      releaseGeometryBuffers(finalGeometry, 'finally-final');
+    }
     // Hide progress immediately on error or stale abort; success hides it after 1500 ms.
     if (!exportSucceeded) exportProgress.classList.add('hidden');
     isExporting = false;
@@ -3749,6 +3776,41 @@ function setProgress(fraction, label) {
   exportProgBar.style.width = `${pct}%`;
   exportProgPct.textContent = `${pct}%`;
   exportProgLbl.textContent = label;
+}
+
+function estimateGeometryBufferMB(geo) {
+  if (!geo?.attributes) return 0;
+  let bytes = 0;
+  for (const attr of Object.values(geo.attributes)) {
+    if (attr?.array?.byteLength) bytes += attr.array.byteLength;
+  }
+  if (geo.index?.array?.byteLength) bytes += geo.index.array.byteLength;
+  return bytes / (1024 * 1024);
+}
+
+function observeExportStage(stageName, geo, stageStats) {
+  if (!geo?.attributes?.position) return;
+  const triCount = geo.attributes.position.count / 3;
+  const estimateMB = estimateGeometryBufferMB(geo);
+  if (stageStats && estimateMB > stageStats.maxObservedMB) stageStats.maxObservedMB = estimateMB;
+  if (EXPORT_STAGE_DEBUG) {
+    console.info(
+      `[export][stage] ${stageName} | tris=${triCount.toLocaleString()} | buffers~${estimateMB.toFixed(2)} MB`
+    );
+  }
+}
+
+function releaseGeometryBuffers(geo, label = '') {
+  if (!geo) return;
+  if (EXPORT_STAGE_DEBUG) {
+    const mb = estimateGeometryBufferMB(geo);
+    console.info(`[export][release] ${label || 'geometry'} | buffers~${mb.toFixed(2)} MB`);
+  }
+  if (geo.attributes) {
+    for (const name of Object.keys(geo.attributes)) geo.deleteAttribute(name);
+  }
+  geo.setIndex(null);
+  geo.dispose();
 }
 
 /**
@@ -3804,6 +3866,7 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
     maxTriangles: settings.maxTriangles,
     decimationOptions: {},
     settings: { ...settings },
+    debugStageStats: EXPORT_STAGE_DEBUG,
     bounds: {
       min: { x: currentBounds.min.x, y: currentBounds.min.y, z: currentBounds.min.z },
       max: { x: currentBounds.max.x, y: currentBounds.max.y, z: currentBounds.max.z },
