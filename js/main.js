@@ -53,6 +53,7 @@ let _shiftLineMesh     = null;        // THREE.Line — preview line from last p
 let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
+let exportWorker          = null;
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
 let _spatialGrid = null;
@@ -79,6 +80,7 @@ const settings = {
   boundaryFalloff:  0,
   symmetricDisplacement: false,
   useDisplacement: false,
+  vaseModeSafe: false,
 };
 
 // ── Canvas filter support (Safari / iOS WebView don't support ctx.filter) ────
@@ -199,6 +201,8 @@ const exportProgress   = document.getElementById('export-progress');
 const exportProgBar    = document.getElementById('export-progress-bar');
 const exportProgPct    = document.getElementById('export-progress-pct');
 const exportProgLbl    = document.getElementById('export-progress-label');
+const exportValidationEl = document.getElementById('export-validation');
+const vaseModeSafeToggle = document.getElementById('vase-mode-safe');
 const triLimitWarning  = document.getElementById('tri-limit-warning');
 const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
@@ -831,6 +835,11 @@ function wireEvents() {
   }
 
   const startExport = (format) => {
+    const validation = renderExportValidation();
+    if (validation.errors.length) {
+      alert(validation.errors.join('\n'));
+      return;
+    }
     if (sessionStorage.getItem('stlt-no-sponsor') === '1') {
       handleExport(format);
       return;
@@ -2209,6 +2218,7 @@ function renderAdvancedDiag(results) {
     meshDiagAdvanced.appendChild(tip);
   }
   applyDiagSeverity();
+  renderExportValidation();
 }
 
 function updateMeshDiagnostics(adjData, triCount) {
@@ -2220,6 +2230,7 @@ function updateMeshDiagnostics(adjData, triCount) {
   meshDiagnostics.classList.remove('hidden');
   meshDiagAdvanced.classList.add('hidden');
   meshDiagRunBtn.disabled = false;
+  renderExportValidation();
 }
 
 function checkResolutionWarning() {
@@ -2865,6 +2876,7 @@ function updatePreview() {
   syncBoundaryEdgeUniforms();
   exportBtn.disabled = false;
   export3mfBtn.disabled = false;
+  renderExportValidation();
 }
 
 // ── Displacement preview ──────────────────────────────────────────────────────
@@ -3364,38 +3376,44 @@ async function handleExport(format = 'stl') {
       ? buildCombinedFaceWeights(currentGeometry, excludedFaces, selectionMode, settings)
       : null;
 
-    let safetyCapHit;
-    ({ geometry: subdivided, safetyCapHit } = await subdivide(
-      currentGeometry, settings.refineLength,
-      (p, triCount, longestEdge) => {
-        const label = triCount != null
-          ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
-          : t('progress.subdividing');
-        setProgress(0.02 + p * 0.35, label);
-      },
-      faceWeights
-    ));
-    if (exportToken !== myToken) return;
-
-    const subTriCount = subdivided.attributes.position.count / 3;
-    setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
-
     const exportEntry = getEffectiveMapEntry();
-    displaced = await runAsync(() =>
-      applyDisplacement(
-        subdivided,
-        exportEntry.imageData,
-        exportEntry.width,
-        exportEntry.height,
-        settings,
-        currentBounds,
-        (p) => setProgress(0.38 + p * 0.32, t('progress.displacingVertices'))
-      )
-    );
-    if (exportToken !== myToken) return;
+    let safetyCapHit = false;
+    try {
+      ({ geometry: displaced, safetyCapHit } = await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+    } catch (workerErr) {
+      console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
+      ({ geometry: subdivided, safetyCapHit } = await subdivide(
+        currentGeometry, settings.refineLength,
+        (p, triCount, longestEdge) => {
+          const label = triCount != null
+            ? t('progress.refining', { cur: triCount.toLocaleString(), edge: longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setProgress(0.02 + p * 0.35, label);
+        },
+        faceWeights
+      ));
+      if (exportToken !== myToken) return;
 
-    // Free subdivided geometry — displacement created a separate copy
-    subdivided.dispose();
+      const subTriCount = subdivided.attributes.position.count / 3;
+      setProgress(0.38, t('progress.applyingDisplacement', { n: subTriCount.toLocaleString() }));
+
+      displaced = await runAsync(() =>
+        applyDisplacement(
+          subdivided,
+          exportEntry.imageData,
+          exportEntry.width,
+          exportEntry.height,
+          settings,
+          currentBounds,
+          (p) => setProgress(0.38 + p * 0.32, t('progress.displacingVertices'))
+        )
+      );
+      if (exportToken !== myToken) return;
+
+      // Free subdivided geometry — displacement created a separate copy
+      subdivided.dispose();
+    }
+    if (exportToken !== myToken) return;
 
     const dispTriCount = displaced.attributes.position.count / 3;
     const needsDecimation = dispTriCount > settings.maxTriangles;
@@ -3519,4 +3537,88 @@ function runAsync(fn) {
 /** Yield to the browser event loop (for progress bar paints etc.). */
 function yieldFrame() {
   return new Promise(r => setTimeout(r, 0));
+}
+
+function _ensureExportWorker() {
+  if (exportWorker) return exportWorker;
+  exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  return exportWorker;
+}
+
+async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
+  if (typeof Worker === 'undefined') {
+    throw new Error('Web Workers are not available in this browser.');
+  }
+
+  const worker = _ensureExportWorker();
+  const pos = currentGeometry.attributes.position.array;
+  const nrm = currentGeometry.attributes.normal.array;
+  const posCopy = new Float32Array(pos);
+  const nrmCopy = new Float32Array(nrm);
+  const texCopy = new Uint8ClampedArray(exportEntry.imageData.data);
+  const exwCopy = faceWeights ? new Float32Array(faceWeights) : null;
+
+  const payload = {
+    type: 'run',
+    geometry: {
+      position: posCopy,
+      normal: nrmCopy,
+      excludeWeight: exwCopy,
+    },
+    texture: {
+      data: texCopy,
+      width: exportEntry.width,
+      height: exportEntry.height,
+    },
+    refineLength: settings.refineLength,
+    settings: { ...settings },
+    bounds: {
+      min: { x: currentBounds.min.x, y: currentBounds.min.y, z: currentBounds.min.z },
+      max: { x: currentBounds.max.x, y: currentBounds.max.y, z: currentBounds.max.z },
+      size: { x: currentBounds.size.x, y: currentBounds.size.y, z: currentBounds.size.z },
+      center: { x: currentBounds.center.x, y: currentBounds.center.y, z: currentBounds.center.z },
+    },
+  };
+
+  return new Promise((resolve, reject) => {
+    const onMessage = (evt) => {
+      if (exportToken !== myToken) {
+        worker.removeEventListener('message', onMessage);
+        reject(new Error('Stale export worker result'));
+        return;
+      }
+      const data = evt.data;
+      if (!data) return;
+      if (data.type === 'progress') {
+        if (data.phase === 'subdivide') {
+          const label = data.triCount != null
+            ? t('progress.refining', { cur: data.triCount.toLocaleString(), edge: data.longestEdge.toFixed(2) })
+            : t('progress.subdividing');
+          setProgress(0.02 + (data.fraction ?? 0) * 0.35, label);
+        } else if (data.phase === 'displace') {
+          setProgress(0.38 + (data.fraction ?? 0) * 0.32, t('progress.displacingVertices'));
+        }
+        return;
+      }
+      if (data.type === 'result') {
+        worker.removeEventListener('message', onMessage);
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
+        geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
+        resolve({ geometry: geo, safetyCapHit: !!data.safetyCapHit });
+        return;
+      }
+      if (data.type === 'error') {
+        worker.removeEventListener('message', onMessage);
+        reject(new Error(data.message || 'Worker processing failed'));
+      }
+    };
+    worker.addEventListener('message', onMessage);
+    worker.postMessage(payload, [
+      payload.geometry.position.buffer,
+      payload.geometry.normal.buffer,
+      payload.texture.data.buffer,
+      ...(payload.geometry.excludeWeight ? [payload.geometry.excludeWeight.buffer] : []),
+    ]);
+  });
 }

@@ -782,6 +782,29 @@ input[type="number"].val:focus { outline: none; border-color: var(--accent); }
 
 .tri-limit-warning.hidden { display: none; }
 
+.export-validation {
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.45;
+  margin-bottom: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+}
+
+.export-validation.hidden { display: none; }
+.export-validation.has-errors {
+  border-color: var(--danger);
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, var(--surface2));
+}
+.export-validation.has-warnings:not(.has-errors) {
+  border-color: #f59e0b;
+  color: #f59e0b;
+  background: color-mix(in srgb, #f59e0b 15%, var(--surface2));
+}
+
 /* ── Amplitude overlap warning ────────────────────────────────────────────────────────────── */
 .amplitude-warning {
   background: color-mix(in srgb, var(--danger) 12%, var(--surface2));
