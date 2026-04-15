@@ -3497,8 +3497,10 @@ async function handleExport(format = 'stl') {
 
     const exportEntry = getEffectiveMapEntry();
     let safetyCapHit = false;
+    let workerDecimationFailed = false;
     try {
-      ({ geometry: displaced, safetyCapHit } = await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed } =
+        await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
     } catch (workerErr) {
       console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
       ({ geometry: subdivided, safetyCapHit } = await subdivide(
@@ -3541,6 +3543,9 @@ async function handleExport(format = 'stl') {
 
     finalGeometry = displaced;
     if (needsDecimation) {
+      if (workerDecimationFailed) {
+        console.warn('Worker decimation failed, running main-thread decimation fallback.');
+      }
       setProgress(0.71, t('progress.decimatingTo', { from: dispTriCount.toLocaleString(), to: settings.maxTriangles.toLocaleString() }));
       finalGeometry = await runAsync(() =>
         decimate(
@@ -3690,6 +3695,8 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
       height: exportEntry.height,
     },
     refineLength: settings.refineLength,
+    maxTriangles: settings.maxTriangles,
+    decimationOptions: {},
     settings: { ...settings },
     bounds: {
       min: { x: currentBounds.min.x, y: currentBounds.min.y, z: currentBounds.min.z },
@@ -3716,6 +3723,23 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
           setProgress(0.02 + (data.fraction ?? 0) * 0.35, label);
         } else if (data.phase === 'displace') {
           setProgress(0.38 + (data.fraction ?? 0) * 0.32, t('progress.displacingVertices'));
+        } else if (data.phase === 'decimate') {
+          const triCount = data.triCount ?? 0;
+          const target = data.targetTriangles ?? settings.maxTriangles;
+          if (data.failed) {
+            setProgress(0.96, t('progress.decimatingTo', {
+              from: triCount.toLocaleString(),
+              to: target.toLocaleString(),
+            }));
+          } else {
+            setProgress(
+              0.71 + (data.fraction ?? 0) * 0.25,
+              t('progress.decimating', {
+                cur: triCount.toLocaleString(),
+                to: target.toLocaleString(),
+              })
+            );
+          }
         }
         return;
       }
@@ -3724,7 +3748,11 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
         geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
-        resolve({ geometry: geo, safetyCapHit: !!data.safetyCapHit });
+        resolve({
+          geometry: geo,
+          safetyCapHit: !!data.safetyCapHit,
+          decimationFailed: !!data.decimationFailed,
+        });
         return;
       }
       if (data.type === 'error') {
