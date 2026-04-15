@@ -190,9 +190,11 @@ const stlFileInput   = document.getElementById('stl-file-input');
 const textureInput   = document.getElementById('texture-file-input');
 const presetGrid     = document.getElementById('preset-grid');
 const activeMapName  = document.getElementById('active-map-name');
+const textureValidationEl = document.getElementById('texture-validation');
 const meshInfo       = document.getElementById('mesh-info');
 const exportBtn        = document.getElementById('export-btn');
 const export3mfBtn     = document.getElementById('export-3mf-btn');
+const exportPresetSelect = document.getElementById('export-preset');
 const exportProgress   = document.getElementById('export-progress');
 const exportProgBar    = document.getElementById('export-progress-bar');
 const exportProgPct    = document.getElementById('export-progress-pct');
@@ -459,6 +461,123 @@ function resetTextureSmoothing() {
   textureSmoothingVal.value    = 0;
 }
 
+function _quantileFromHist(hist, q, total) {
+  const target = Math.max(0, Math.min(total - 1, Math.floor(q * (total - 1))));
+  let acc = 0;
+  for (let i = 0; i < 256; i++) {
+    acc += hist[i];
+    if (acc > target) return i / 255;
+  }
+  return 1;
+}
+
+function analyzeTextureQuality(entry) {
+  const { imageData, width, height } = entry;
+  const data = imageData.data;
+  const pxCount = width * height;
+  const hist = new Uint32Array(256);
+  let sumL = 0;
+  let sumL2 = 0;
+  let colorDiffSum = 0;
+
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    const l = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    hist[l]++;
+    sumL += l;
+    sumL2 += l * l;
+    colorDiffSum += (Math.abs(r - g) + Math.abs(g - b) + Math.abs(b - r)) / (3 * 255);
+  }
+
+  const mean = sumL / pxCount;
+  const variance = Math.max(0, sumL2 / pxCount - mean * mean);
+  const stdNorm = Math.sqrt(variance) / 255;
+  const p01 = _quantileFromHist(hist, 0.01, pxCount);
+  const p99 = _quantileFromHist(hist, 0.99, pxCount);
+  const dynamicRange = Math.max(0, p99 - p01);
+  const clipLow = hist[0] / pxCount;
+  const clipHigh = hist[255] / pxCount;
+
+  let seamAcc = 0;
+  for (let y = 0; y < height; y++) {
+    const lOff = (y * width) * 4;
+    const rOff = (y * width + (width - 1)) * 4;
+    seamAcc += Math.abs(data[lOff] - data[rOff]);
+  }
+  for (let x = 0; x < width; x++) {
+    const tOff = x * 4;
+    const bOff = ((height - 1) * width + x) * 4;
+    seamAcc += Math.abs(data[tOff] - data[bOff]);
+  }
+  const seamScore = seamAcc / ((width + height) * 255);
+
+  return {
+    grayscaleDeviation: colorDiffSum / pxCount,
+    histogramStd: stdNorm,
+    dynamicRange,
+    clipLow,
+    clipHigh,
+    seamScore,
+  };
+}
+
+function validateTextureEntry(entry) {
+  if (entry._validation) return entry._validation;
+  const metrics = analyzeTextureQuality(entry);
+  const issues = [];
+
+  if (metrics.grayscaleDeviation > 0.12) {
+    issues.push({ level: 'error', message: 'Texture appears to be strongly colored; use a grayscale displacement map.' });
+  } else if (metrics.grayscaleDeviation > 0.03) {
+    issues.push({ level: 'warn', message: 'Texture is not purely grayscale. Converting to grayscale is recommended.' });
+  }
+
+  if (metrics.dynamicRange < 0.10 || metrics.histogramStd < 0.10) {
+    issues.push({ level: 'warn', message: 'Low contrast histogram; displacement may look flat.' });
+  }
+
+  if (metrics.clipLow + metrics.clipHigh > 0.20) {
+    issues.push({ level: 'warn', message: 'Histogram clipping detected; details may crush at min/max height.' });
+  }
+
+  if (metrics.seamScore > 0.12) {
+    issues.push({ level: 'warn', message: 'High seam mismatch score; tiling seams may be visible.' });
+  }
+
+  const severity = issues.some(i => i.level === 'error')
+    ? 'error'
+    : issues.some(i => i.level === 'warn')
+      ? 'warn'
+      : 'ok';
+
+  const result = { metrics, issues, severity };
+  entry._validation = result;
+  return result;
+}
+
+function renderTextureValidation(validation) {
+  if (!textureValidationEl) return;
+  textureValidationEl.classList.remove('hidden', 'ok', 'warn', 'error');
+  textureValidationEl.classList.add(validation.severity);
+  const m = validation.metrics;
+  const headline = validation.severity === 'ok'
+    ? '✓ Texture quality check passed.'
+    : validation.severity === 'warn'
+      ? '⚠ Texture quality warnings.'
+      : '⛔ Texture rejected.';
+  const metricLine = `Gray Δ ${m.grayscaleDeviation.toFixed(3)} · Range ${m.dynamicRange.toFixed(2)} · Seam ${m.seamScore.toFixed(2)}`;
+  const issueLine = validation.issues.length
+    ? validation.issues.map(i => `• ${i.message}`).join('<br/>')
+    : '• Ready for displacement.';
+  textureValidationEl.innerHTML = `${headline}<br/>${metricLine}<br/>${issueLine}`;
+}
+
+function clearTextureValidation() {
+  if (!textureValidationEl) return;
+  textureValidationEl.className = 'texture-validation hidden';
+  textureValidationEl.textContent = '';
+}
+
 let _selectGeneration = 0;   // debounce rapid preset clicks
 
 async function selectPreset(idx, swatchEl) {
@@ -474,6 +593,9 @@ async function selectPreset(idx, swatchEl) {
 
   // If full texture is already loaded, use it directly
   if (entry.texture) {
+    const validation = validateTextureEntry(entry);
+    renderTextureValidation(validation);
+    if (validation.severity === 'error') return;
     activeMapEntry = entry;
     updatePreview();
     return;
@@ -485,6 +607,13 @@ async function selectPreset(idx, swatchEl) {
     const full = await loadFullPreset(idx);
     if (gen !== _selectGeneration) return;   // user clicked another preset meanwhile
     PRESETS[idx] = { ...entry, ...full };
+    const validation = validateTextureEntry(PRESETS[idx]);
+    renderTextureValidation(validation);
+    if (validation.severity === 'error') {
+      swatchEl.classList.remove('active');
+      swatchEl.classList.remove('preset-loading-full');
+      return;
+    }
     activeMapEntry = PRESETS[idx];
     swatchEl.classList.remove('preset-loading-full');
     updatePreview();
@@ -580,7 +709,15 @@ function wireEvents() {
     const file = e.target.files[0];
     if (!file) return;
     try {
-      activeMapEntry = await loadCustomTexture(file);
+      const candidate = await loadCustomTexture(file);
+      const validation = validateTextureEntry(candidate);
+      renderTextureValidation(validation);
+      if (validation.severity === 'error') {
+        alert(validation.issues.map(i => i.message).join('\n'));
+        textureInput.value = '';
+        return;
+      }
+      activeMapEntry = candidate;
       activeMapEntry.isCustom = true;
       activeMapName.textContent = file.name;
       document.querySelectorAll('.preset-swatch').forEach(s => s.classList.remove('active'));
@@ -687,6 +824,12 @@ function wireEvents() {
   });
 
   // ── Export ──
+  if (exportPresetSelect) {
+    exportPresetSelect.addEventListener('change', () => {
+      applyExportPreset(exportPresetSelect.value);
+    });
+  }
+
   const startExport = (format) => {
     if (sessionStorage.getItem('stlt-no-sponsor') === '1') {
       handleExport(format);
@@ -1575,6 +1718,13 @@ function updateBucketHover(e) {
 // ── Slider helper ─────────────────────────────────────────────────────────────
 
 const INPUT_WHEEL_DECIMALS = 3;
+const EXPORT_PRESETS = {
+  fast:     { refineLength: 1.5, maxTriangles: 300_000 },
+  balanced: { refineLength: 1.0, maxTriangles: 750_000 },
+  high:     { refineLength: 0.35, maxTriangles: 2_000_000 },
+  vase:     { refineLength: 0.45, maxTriangles: 1_200_000 },
+  large:    { refineLength: 1.6, maxTriangles: 500_000 },
+};
 
 function getInputPrecision(input) {
   const configured = parseInt(input.dataset.wheelDecimals, 10);
@@ -1638,6 +1788,20 @@ function addFineWheelSupport(input, applyFn) {
 
     applyFn(next);
   }, { passive: false });
+}
+
+function applyExportPreset(presetKey) {
+  const preset = EXPORT_PRESETS[presetKey];
+  if (!preset) return;
+  settings.refineLength = preset.refineLength;
+  settings.maxTriangles = preset.maxTriangles;
+  refineLenSlider.value = preset.refineLength;
+  refineLenVal.value = formatInputValue(refineLenVal, preset.refineLength);
+  maxTriSlider.value = preset.maxTriangles;
+  maxTriVal.textContent = formatM(preset.maxTriangles);
+  checkResolutionWarning();
+  clearTimeout(previewDebounce);
+  previewDebounce = setTimeout(updatePreview, 80);
 }
 
 function linkSlider(slider, valInput, onChangeFn, livePreview = true) {
@@ -2675,6 +2839,7 @@ function updatePreview() {
     }
     exportBtn.disabled = true;
     export3mfBtn.disabled = true;
+    clearTextureValidation();
     return;
   }
 
