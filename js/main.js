@@ -4033,9 +4033,14 @@ async function handleExport(format = 'stl') {
     const exportEntry = getEffectiveMapEntry();
     let safetyCapHit = false;
     let workerDecimationFailed = false;
+    let workerStageTriCounts = null;
     try {
-      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed } =
+      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed, stageTriCounts: workerStageTriCounts } =
         await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+      if (EXPORT_STAGE_DEBUG) {
+        await runExportParityTriangleCheck(faceWeights, exportEntry, myToken, workerStageTriCounts);
+        if (exportToken !== myToken) return;
+      }
     } catch (workerErr) {
       const permanentFallback = exportWorkerState === 'permanent-fallback';
       const workerTelemetryState = permanentFallback ? 'permanent-fallback' : 'fallback-this-run';
@@ -4375,6 +4380,7 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
           geometry: geo,
           safetyCapHit: !!data.safetyCapHit,
           decimationFailed: !!data.decimationFailed,
+          stageTriCounts: data.stageTriCounts || null,
         });
         return;
       }
@@ -4407,4 +4413,72 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
       ...(payload.geometry.excludeWeight ? [payload.geometry.excludeWeight.buffer] : []),
     ]);
   });
+}
+
+async function runExportParityTriangleCheck(faceWeights, exportEntry, myToken, workerStageTriCounts) {
+  if (!workerStageTriCounts) return;
+
+  let fallbackSubdivided = null;
+  let fallbackDisplaced = null;
+  let fallbackFinal = null;
+  try {
+    ({ geometry: fallbackSubdivided } = await subdivide(
+      currentGeometry,
+      settings.refineLength,
+      null,
+      faceWeights
+    ));
+    if (exportToken !== myToken) return;
+
+    fallbackDisplaced = await runAsync(() =>
+      applyDisplacement(
+        fallbackSubdivided,
+        exportEntry.imageData,
+        exportEntry.width,
+        exportEntry.height,
+        settings,
+        currentBounds
+      )
+    );
+    if (exportToken !== myToken) return;
+
+    fallbackFinal = fallbackDisplaced;
+    const fallbackDispTriCount = fallbackDisplaced.attributes.position.count / 3;
+    if (fallbackDispTriCount > settings.maxTriangles) {
+      fallbackFinal = await runAsync(() =>
+        decimate(
+          fallbackDisplaced,
+          settings.maxTriangles
+        )
+      );
+      if (exportToken !== myToken) return;
+    }
+
+    const fallbackStageTriCounts = {
+      subdivision: fallbackSubdivided.attributes.position.count / 3,
+      displacement: fallbackDisplaced.attributes.position.count / 3,
+      final: fallbackFinal.attributes.position.count / 3,
+    };
+
+    if (
+      fallbackStageTriCounts.subdivision !== workerStageTriCounts.subdivision ||
+      fallbackStageTriCounts.displacement !== workerStageTriCounts.displacement ||
+      fallbackStageTriCounts.final !== workerStageTriCounts.final
+    ) {
+      console.error('[export][debug-parity] Worker/fallback triangle-count mismatch.', {
+        worker: workerStageTriCounts,
+        fallback: fallbackStageTriCounts,
+      });
+    } else {
+      console.info('[export][debug-parity] Worker/fallback triangle counts match.', workerStageTriCounts);
+    }
+  } finally {
+    if (fallbackSubdivided) releaseGeometryBuffers(fallbackSubdivided, 'debug-parity-subdivided');
+    if (fallbackDisplaced && fallbackDisplaced !== fallbackSubdivided) {
+      releaseGeometryBuffers(fallbackDisplaced, 'debug-parity-displaced');
+    }
+    if (fallbackFinal && fallbackFinal !== fallbackDisplaced && fallbackFinal !== fallbackSubdivided) {
+      releaseGeometryBuffers(fallbackFinal, 'debug-parity-final');
+    }
+  }
 }

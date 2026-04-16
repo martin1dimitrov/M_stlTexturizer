@@ -49,6 +49,7 @@ function releaseGeometryBuffers(geo, label = '', debugStageStats = false) {
 self.onmessage = async (e) => {
   const msg = e.data;
   if (!msg || msg.type !== 'run') return;
+  const stageStats = { maxObservedMB: 0 };
 
   let subdivided = null;
   let displaced = null;
@@ -71,7 +72,7 @@ self.onmessage = async (e) => {
           longestEdge,
         });
       },
-      null
+      msg.geometry.excludeWeight
     );
 
     subdivided = subdivResult.geometry;
@@ -148,6 +149,11 @@ self.onmessage = async (e) => {
         type: 'result',
         safetyCapHit: subdivResult.safetyCapHit,
         decimationFailed,
+        stageTriCounts: {
+          subdivision: subdivided.attributes.position.count / 3,
+          displacement: displaced.attributes.position.count / 3,
+          final: finalGeometry.attributes.position.count / 3,
+        },
         position: outPos,
         normal: outNrm,
         vaseMetrics: displaced.userData?.vaseMetrics || null,
