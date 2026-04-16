@@ -479,6 +479,11 @@ function populateLanguageSelector() {
       if (lastFastDiag) renderFastDiag(lastFastDiag);
       if (lastAdvancedDiag) renderAdvancedDiag(lastAdvancedDiag);
     }
+
+    if (activeMapEntry?._validation) {
+      renderTextureValidation(activeMapEntry._validation);
+    }
+    renderExportValidation();
   });
 
   languageSelector.appendChild(select);
@@ -646,21 +651,21 @@ function validateTextureEntry(entry) {
   const issues = [];
 
   if (metrics.grayscaleDeviation > 0.12) {
-    issues.push({ level: 'error', message: 'Texture appears to be strongly colored; use a grayscale displacement map.' });
+    issues.push({ level: 'error', message: t('textureValidation.strongColor') });
   } else if (metrics.grayscaleDeviation > 0.03) {
-    issues.push({ level: 'warn', message: 'Texture is not purely grayscale. Converting to grayscale is recommended.' });
+    issues.push({ level: 'warn', message: t('textureValidation.notGrayscale') });
   }
 
   if (metrics.dynamicRange < 0.10 || metrics.histogramStd < 0.10) {
-    issues.push({ level: 'warn', message: 'Low contrast histogram; displacement may look flat.' });
+    issues.push({ level: 'warn', message: t('textureValidation.lowContrast') });
   }
 
   if (metrics.clipLow + metrics.clipHigh > 0.20) {
-    issues.push({ level: 'warn', message: 'Histogram clipping detected; details may crush at min/max height.' });
+    issues.push({ level: 'warn', message: t('textureValidation.clipping') });
   }
 
   if (metrics.seamScore > 0.12) {
-    issues.push({ level: 'warn', message: 'High seam mismatch score; tiling seams may be visible.' });
+    issues.push({ level: 'warn', message: t('textureValidation.seamMismatch') });
   }
 
   const severity = issues.some(i => i.level === 'error')
@@ -680,14 +685,18 @@ function renderTextureValidation(validation) {
   textureValidationEl.classList.add(validation.severity);
   const m = validation.metrics;
   const headline = validation.severity === 'ok'
-    ? '✓ Texture quality check passed.'
+    ? t('textureValidation.headlineOk')
     : validation.severity === 'warn'
-      ? '⚠ Texture quality warnings.'
-      : '⛔ Texture rejected.';
-  const metricLine = `Gray Δ ${m.grayscaleDeviation.toFixed(3)} · Range ${m.dynamicRange.toFixed(2)} · Seam ${m.seamScore.toFixed(2)}`;
+      ? t('textureValidation.headlineWarn')
+      : t('textureValidation.headlineError');
+  const metricLine = t('textureValidation.metrics', {
+    gray: m.grayscaleDeviation.toFixed(3),
+    range: m.dynamicRange.toFixed(2),
+    seam: m.seamScore.toFixed(2),
+  });
   const issueLine = validation.issues.length
     ? validation.issues.map(i => `• ${i.message}`).join('<br/>')
-    : '• Ready for displacement.';
+    : `• ${t('textureValidation.ready')}`;
   textureValidationEl.innerHTML = `${headline}<br/>${metricLine}<br/>${issueLine}`;
 }
 
@@ -2696,11 +2705,11 @@ function collectExportValidation() {
 
   if (settings.vaseModeSafe) {
     if (settings.mappingMode !== 3) {
-      errors.push('Vase Workflow Safeguards require Cylindrical mapping. Set Projection → Cylindrical for Spiral Vase exports.');
+      errors.push(t('exportValidation.vaseNeedsCylindrical'));
     }
     const vaseMetrics = lastVaseMetrics || _estimateVaseMetrics();
     if (!vaseMetrics) {
-      errors.push('Vase validation could not run. Load a displacement map and keep Cylindrical mapping enabled for Spiral Vase compatibility checks.');
+      errors.push(t('exportValidation.vaseValidationUnavailable'));
     } else {
       const seamRisk = (vaseMetrics.seamBlendSamples > 0)
         ? Math.abs(0.5 - vaseMetrics.seamBlendMixMean)
@@ -2710,13 +2719,16 @@ function collectExportValidation() {
       const radialRiskMm = vaseMetrics.maxInwardRiskMm ?? vaseMetrics.maxRadialInwardMm ?? 0;
 
       if (seamRisk > 0.22) {
-        errors.push('Spiral Vase seam continuity is unsafe. Reduce Transition Smoothing or lower texture Scale U to keep the seam band continuous.');
+        errors.push(t('exportValidation.vaseSeamUnsafe'));
       }
       if (hfMetric > 0.055) {
-        errors.push('Circumferential detail is too high-frequency for reliable Spiral Vase walls. Increase texture smoothing or use a softer map.');
+        errors.push(t('exportValidation.vaseHighFrequency'));
       }
       if (radialRiskCount > 0 || radialRiskMm > settings.vaseRadialGuardMm + 1e-4) {
-        errors.push(`Radial reversal risk detected (${radialRiskCount} bands, max ${radialRiskMm.toFixed(3)} mm inward). Reduce amplitude or enable symmetric displacement for Spiral Vase.`);
+        errors.push(t('exportValidation.vaseRadialRisk', {
+          bands: radialRiskCount,
+          mm: radialRiskMm.toFixed(3),
+        }));
       }
     }
   }
@@ -2741,11 +2753,13 @@ function renderExportValidation() {
   if (validation.estimate) {
     const est = validation.estimate;
     const estimateText = [
-      `~${_formatEstimateRange(est.estimatedPreDecimationTriangles)} tris pre-decimation`,
-      `${_formatEstimateRange(est.estimatedPostDecimationTriangles)} post`,
-      `${_formatEstimateRange(est.estimatedPeakMemoryMB, { maximumFractionDigits: 1, minimumFractionDigits: 1 })} MB peak`,
+      t('exportValidation.estimatePre', { n: _formatEstimateRange(est.estimatedPreDecimationTriangles) }),
+      t('exportValidation.estimatePost', { n: _formatEstimateRange(est.estimatedPostDecimationTriangles) }),
+      t('exportValidation.estimatePeakMemory', {
+        n: _formatEstimateRange(est.estimatedPeakMemoryMB, { maximumFractionDigits: 1, minimumFractionDigits: 1 }),
+      }),
     ].join(' · ');
-    lines.push(`<div class="estimate-line">≈ ${estimateText}</div>`);
+    lines.push(`<div class="estimate-line">${t('exportValidation.estimatePrefix')} ${estimateText}</div>`);
   }
 
   for (const msg of validation.errors) lines.push(`⛔ ${msg}`);
