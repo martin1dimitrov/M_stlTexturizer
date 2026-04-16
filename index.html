@@ -502,11 +502,30 @@
         banner.textContent = warningText;
         document.body.prepend(banner);
 
+        const warnedInputs = new Set();
         const wireInputWarning = (id) => {
           const input = document.getElementById(id);
           if (!input) return;
-          input.addEventListener('click', () => alert(warningText));
-          input.addEventListener('change', () => alert(warningText));
+          const handler = (event) => {
+            event.preventDefault();
+            if (warnedInputs.has(id)) return;
+            warnedInputs.add(id);
+            alert(warningText);
+          };
+
+          input.disabled = true;
+          input.title = warningText;
+          input.addEventListener('click', handler);
+
+          document.querySelectorAll(`label[for="${id}"]`).forEach((label) => {
+            const message = document.createElement('small');
+            message.textContent = warningText;
+            message.style.display = 'block';
+            message.style.marginTop = '0.35rem';
+            message.style.opacity = '0.7';
+            message.style.fontSize = '0.72rem';
+            label.insertAdjacentElement('afterend', message);
+          });
         };
         wireInputWarning('stl-file-input');
         wireInputWarning('texture-file-input');

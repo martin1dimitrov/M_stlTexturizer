@@ -1,7 +1,7 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
-import { subdivide } from '../subdivision.js';
-import { applyDisplacement } from '../displacement.js';
-import { decimate } from '../decimation.js';
+import { subdivide } from './subdivision.worker.js';
+import { applyDisplacement } from './displacement.worker.js';
+import { decimate } from './decimation.worker.js';
 
 function buildGeometry(position, normal, excludeWeight = null) {
   const geo = new THREE.BufferGeometry();
@@ -49,10 +49,12 @@ function releaseGeometryBuffers(geo, label = '', debugStageStats = false) {
 self.onmessage = async (e) => {
   const msg = e.data;
   if (!msg || msg.type !== 'run') return;
+  const stageStats = { maxObservedMB: 0 };
 
   let subdivided = null;
   let displaced = null;
   let finalGeometry = null;
+  const stageStats = { maxObservedMB: 0 };
 
   try {
     const geometry = buildGeometry(msg.geometry.position, msg.geometry.normal, msg.geometry.excludeWeight);
@@ -70,7 +72,7 @@ self.onmessage = async (e) => {
           longestEdge,
         });
       },
-      null
+      msg.geometry.excludeWeight
     );
 
     subdivided = subdivResult.geometry;
@@ -147,6 +149,11 @@ self.onmessage = async (e) => {
         type: 'result',
         safetyCapHit: subdivResult.safetyCapHit,
         decimationFailed,
+        stageTriCounts: {
+          subdivision: subdivided.attributes.position.count / 3,
+          displacement: displaced.attributes.position.count / 3,
+          final: finalGeometry.attributes.position.count / 3,
+        },
         position: outPos,
         normal: outNrm,
         vaseMetrics: displaced.userData?.vaseMetrics || null,

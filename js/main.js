@@ -59,6 +59,8 @@ let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
 let exportWorker          = null;
+let exportWorkerState     = 'unknown'; // 'unknown' | 'operational' | 'permanent-fallback'
+let exportWorkerReason    = '';
 const EXPORT_STAGE_DEBUG = /\bexportStageDebug=1\b/.test(window.location.search);
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
@@ -480,6 +482,11 @@ function populateLanguageSelector() {
       if (lastFastDiag) renderFastDiag(lastFastDiag);
       if (lastAdvancedDiag) renderAdvancedDiag(lastAdvancedDiag);
     }
+
+    if (activeMapEntry?._validation) {
+      renderTextureValidation(activeMapEntry._validation);
+    }
+    renderExportValidation();
   });
 
   languageSelector.appendChild(select);
@@ -581,11 +588,95 @@ function resetTextureSmoothing() {
   vaseValidationCache = { key: '', metrics: null };
 }
 
+function _quantileFromHist(hist, q, total) {
+  const target = Math.max(0, Math.min(total - 1, Math.floor(q * (total - 1))));
+  let acc = 0;
+  for (let i = 0; i < 256; i++) {
+    acc += hist[i];
+    if (acc > target) return i / 255;
+  }
+  return 1;
+}
+
+function analyzeTextureQuality(entry) {
+  const { imageData, width, height } = entry;
+  const data = imageData.data;
+  const pxCount = width * height;
+  const hist = new Uint32Array(256);
+  const gray = new Uint8Array(pxCount);
+  let sumL = 0;
+  let sumL2 = 0;
+  let colorDiffSum = 0;
+
+  for (let i = 0, px = 0; i < data.length; i += 4, px++) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    // Keep seam checks in the same perceptual space as the histogram metrics.
+    const l = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    gray[px] = l;
+    hist[l]++;
+    sumL += l;
+    sumL2 += l * l;
+    colorDiffSum += (Math.abs(r - g) + Math.abs(g - b) + Math.abs(b - r)) / (3 * 255);
+  }
+
+  const mean = sumL / pxCount;
+  const variance = Math.max(0, sumL2 / pxCount - mean * mean);
+  const stdNorm = Math.sqrt(variance) / 255;
+  const p01 = _quantileFromHist(hist, 0.01, pxCount);
+  const p99 = _quantileFromHist(hist, 0.99, pxCount);
+  const dynamicRange = Math.max(0, p99 - p01);
+  const clipLow = hist[0] / pxCount;
+  const clipHigh = hist[255] / pxCount;
+
+  let seamAcc = 0;
+  for (let y = 0; y < height; y++) {
+    const rowOff = y * width;
+    seamAcc += Math.abs(gray[rowOff] - gray[rowOff + (width - 1)]);
+  }
+  const lastRowOff = (height - 1) * width;
+  for (let x = 0; x < width; x++) {
+    seamAcc += Math.abs(gray[x] - gray[lastRowOff + x]);
+  }
+  const seamScore = seamAcc / ((width + height) * 255);
+
+  return {
+    grayscaleDeviation: colorDiffSum / pxCount,
+    histogramStd: stdNorm,
+    dynamicRange,
+    clipLow,
+    clipHigh,
+    seamScore,
+  };
+}
 
 function validateTextureEntry(entry) {
   if (entry._validation) return entry._validation;
   const metrics = analyzeTextureQuality(entry);
-  const { issues, severity } = classifyTextureQuality(metrics);
+  const issues = [];
+
+  if (metrics.grayscaleDeviation > 0.12) {
+    issues.push({ level: 'error', message: t('textureValidation.strongColor') });
+  } else if (metrics.grayscaleDeviation > 0.03) {
+    issues.push({ level: 'warn', message: t('textureValidation.notGrayscale') });
+  }
+
+  if (metrics.dynamicRange < 0.10 || metrics.histogramStd < 0.10) {
+    issues.push({ level: 'warn', message: t('textureValidation.lowContrast') });
+  }
+
+  if (metrics.clipLow + metrics.clipHigh > 0.18) {
+    issues.push({ level: 'warn', message: 'Histogram clipping detected; details may crush at min/max height.' });
+  }
+
+  if (metrics.seamScore > 0.10) {
+    issues.push({ level: 'warn', message: 'High seam mismatch score; tiling seams may be visible.' });
+  }
+
+  const severity = issues.some(i => i.level === 'error')
+    ? 'error'
+    : issues.some(i => i.level === 'warn')
+      ? 'warn'
+      : 'ok';
 
   const result = { metrics, issues, severity };
   entry._validation = result;
@@ -598,14 +689,18 @@ function renderTextureValidation(validation) {
   textureValidationEl.classList.add(validation.severity);
   const m = validation.metrics;
   const headline = validation.severity === 'ok'
-    ? '✓ Texture quality check passed.'
+    ? t('textureValidation.headlineOk')
     : validation.severity === 'warn'
-      ? '⚠ Texture quality warnings.'
-      : '⛔ Texture rejected.';
-  const metricLine = `Gray Δ ${m.grayscaleDeviation.toFixed(3)} · Range ${m.dynamicRange.toFixed(2)} · Seam ${m.seamScore.toFixed(2)}`;
+      ? t('textureValidation.headlineWarn')
+      : t('textureValidation.headlineError');
+  const metricLine = t('textureValidation.metrics', {
+    gray: m.grayscaleDeviation.toFixed(3),
+    range: m.dynamicRange.toFixed(2),
+    seam: m.seamScore.toFixed(2),
+  });
   const issueLine = validation.issues.length
     ? validation.issues.map(i => `• ${i.message}`).join('<br/>')
-    : '• Ready for displacement.';
+    : `• ${t('textureValidation.ready')}`;
   textureValidationEl.innerHTML = `${headline}<br/>${metricLine}<br/>${issueLine}`;
 }
 
@@ -2576,18 +2671,64 @@ function _estimateVaseMetrics() {
 }
 
 function collectExportValidation() {
-  const hasGeometry = !!currentGeometry?.attributes?.position;
-  const triCount = hasGeometry ? currentGeometry.attributes.position.count / 3 : 0;
-  const vaseMetrics = settings.vaseModeSafe ? (lastVaseMetrics || _estimateVaseMetrics()) : null;
-  const { warnings, errors } = collectExportValidationCore({
-    hasGeometry,
-    triCount,
-    settings,
-    lastFastDiag,
-    lastAdvancedDiag,
-    vaseMetrics,
-    t,
-  });
+  const warnings = [];
+  const errors = [];
+
+  if (!currentGeometry?.attributes?.position) {
+    return { warnings, errors, estimate: null };
+  }
+
+  const triCount = currentGeometry.attributes.position.count / 3;
+
+  if (lastFastDiag?.nonManifoldEdges > 0) {
+    errors.push(t('diag.nonManifoldEdges', { n: lastFastDiag.nonManifoldEdges }));
+  }
+  if (lastAdvancedDiag?.intersectingPairs > 0) {
+    errors.push(t('diag.intersectingTris', { n: lastAdvancedDiag.intersectingPairs }));
+  }
+  if (lastFastDiag?.openEdges > 0) {
+    warnings.push(t('diag.openEdges', { n: lastFastDiag.openEdges }));
+  }
+  if (lastFastDiag?.shellCount > 1) {
+    warnings.push(t('diag.multipleShells', { n: lastFastDiag.shellCount }));
+  }
+  if (lastAdvancedDiag?.overlappingPairs > 0) {
+    warnings.push(t('diag.overlappingTris', { n: lastAdvancedDiag.overlappingPairs }));
+  }
+  if (triCount > settings.maxTriangles) {
+    warnings.push(t('warnings.safetyCapHit'));
+  }
+
+  if (settings.vaseModeSafe) {
+    if (settings.mappingMode !== 3) {
+      errors.push(t('exportValidation.vaseNeedsCylindrical'));
+    }
+    const vaseMetrics = lastVaseMetrics || _estimateVaseMetrics();
+    if (!vaseMetrics) {
+      errors.push(t('exportValidation.vaseValidationUnavailable'));
+    } else {
+      const seamRisk = (vaseMetrics.seamBlendSamples > 0)
+        ? Math.abs(0.5 - vaseMetrics.seamBlendMixMean)
+        : vaseMetrics.seamZoneRatio;
+      const hfMetric = vaseMetrics.attenuatedHFMean ?? vaseMetrics.circumferentialHFMean;
+      const radialRiskCount = vaseMetrics.radialReversalRiskCount ?? vaseMetrics.radialReversalCorrections ?? 0;
+      const radialRiskMm = vaseMetrics.maxInwardRiskMm ?? vaseMetrics.maxRadialInwardMm ?? 0;
+
+      if (seamRisk > 0.22) {
+        errors.push(t('exportValidation.vaseSeamUnsafe'));
+      }
+      if (hfMetric > 0.055) {
+        errors.push(t('exportValidation.vaseHighFrequency'));
+      }
+      if (radialRiskCount > 0 || radialRiskMm > settings.vaseRadialGuardMm + 1e-4) {
+        errors.push(t('exportValidation.vaseRadialRisk', {
+          bands: radialRiskCount,
+          mm: radialRiskMm.toFixed(3),
+        }));
+      }
+    }
+  }
+
   return {
     warnings,
     errors,
@@ -2608,11 +2749,13 @@ function renderExportValidation() {
   if (validation.estimate) {
     const est = validation.estimate;
     const estimateText = [
-      `~${_formatEstimateRange(est.estimatedPreDecimationTriangles)} tris pre-decimation`,
-      `${_formatEstimateRange(est.estimatedPostDecimationTriangles)} post`,
-      `${_formatEstimateRange(est.estimatedPeakMemoryMB, { maximumFractionDigits: 1, minimumFractionDigits: 1 })} MB peak`,
+      t('exportValidation.estimatePre', { n: _formatEstimateRange(est.estimatedPreDecimationTriangles) }),
+      t('exportValidation.estimatePost', { n: _formatEstimateRange(est.estimatedPostDecimationTriangles) }),
+      t('exportValidation.estimatePeakMemory', {
+        n: _formatEstimateRange(est.estimatedPeakMemoryMB, { maximumFractionDigits: 1, minimumFractionDigits: 1 }),
+      }),
     ].join(' · ');
-    lines.push(`<div class="estimate-line">≈ ${estimateText}</div>`);
+    lines.push(`<div class="estimate-line">${t('exportValidation.estimatePrefix')} ${estimateText}</div>`);
   }
 
   for (const msg of validation.errors) lines.push(`⛔ ${msg}`);
@@ -3898,11 +4041,25 @@ async function handleExport(format = 'stl') {
     const exportEntry = getEffectiveMapEntry();
     let safetyCapHit = false;
     let workerDecimationFailed = false;
+    let workerStageTriCounts = null;
     try {
-      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed } =
+      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed, stageTriCounts: workerStageTriCounts } =
         await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+      if (EXPORT_STAGE_DEBUG) {
+        await runExportParityTriangleCheck(faceWeights, exportEntry, myToken, workerStageTriCounts);
+        if (exportToken !== myToken) return;
+      }
     } catch (workerErr) {
-      console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
+      const permanentFallback = exportWorkerState === 'permanent-fallback';
+      const workerTelemetryState = permanentFallback ? 'permanent-fallback' : 'fallback-this-run';
+      const reason = workerErr?.message || String(workerErr);
+      console.warn(
+        `[export][worker-path:${workerTelemetryState}] ` +
+        (permanentFallback
+          ? 'Worker path is disabled; main-thread fallback is now permanent.'
+          : 'Worker path failed this export; using main-thread fallback for this run.'),
+        { reason, workerState: exportWorkerState }
+      );
       ({ geometry: subdivided, safetyCapHit } = await subdivide(
         currentGeometry, settings.refineLength,
         (p, triCount, longestEdge) => {
@@ -4125,8 +4282,17 @@ function yieldFrame() {
 }
 
 function _ensureExportWorker() {
+  if (exportWorkerState === 'permanent-fallback') {
+    throw new Error(exportWorkerReason || 'Export worker disabled: permanent fallback mode.');
+  }
   if (exportWorker) return exportWorker;
-  exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  try {
+    exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  } catch (err) {
+    exportWorkerState = 'permanent-fallback';
+    exportWorkerReason = err?.message || String(err);
+    throw new Error(`Export worker init failed (permanent fallback): ${exportWorkerReason}`);
+  }
   return exportWorker;
 }
 
@@ -4169,9 +4335,15 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
   };
 
   return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      worker.removeEventListener('message', onMessage);
+      worker.removeEventListener('error', onError);
+      worker.removeEventListener('messageerror', onMessageError);
+    };
+
     const onMessage = (evt) => {
       if (exportToken !== myToken) {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
         reject(new Error('Stale export worker result'));
         return;
       }
@@ -4206,7 +4378,9 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
         return;
       }
       if (data.type === 'result') {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
+        exportWorkerState = 'operational';
+        exportWorkerReason = '';
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
         geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
@@ -4214,15 +4388,32 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
           geometry: geo,
           safetyCapHit: !!data.safetyCapHit,
           decimationFailed: !!data.decimationFailed,
+          stageTriCounts: data.stageTriCounts || null,
         });
         return;
       }
       if (data.type === 'error') {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
         reject(new Error(data.message || 'Worker processing failed'));
       }
     };
+    const onError = (evt) => {
+      cleanup();
+      if (exportWorker) {
+        exportWorker.terminate();
+        exportWorker = null;
+      }
+      exportWorkerState = 'permanent-fallback';
+      exportWorkerReason = evt?.message || 'Worker runtime error';
+      reject(new Error(`Export worker runtime error (permanent fallback): ${exportWorkerReason}`));
+    };
+    const onMessageError = () => {
+      cleanup();
+      reject(new Error('Export worker message transport error'));
+    };
     worker.addEventListener('message', onMessage);
+    worker.addEventListener('error', onError);
+    worker.addEventListener('messageerror', onMessageError);
     worker.postMessage(payload, [
       payload.geometry.position.buffer,
       payload.geometry.normal.buffer,
@@ -4230,4 +4421,72 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
       ...(payload.geometry.excludeWeight ? [payload.geometry.excludeWeight.buffer] : []),
     ]);
   });
+}
+
+async function runExportParityTriangleCheck(faceWeights, exportEntry, myToken, workerStageTriCounts) {
+  if (!workerStageTriCounts) return;
+
+  let fallbackSubdivided = null;
+  let fallbackDisplaced = null;
+  let fallbackFinal = null;
+  try {
+    ({ geometry: fallbackSubdivided } = await subdivide(
+      currentGeometry,
+      settings.refineLength,
+      null,
+      faceWeights
+    ));
+    if (exportToken !== myToken) return;
+
+    fallbackDisplaced = await runAsync(() =>
+      applyDisplacement(
+        fallbackSubdivided,
+        exportEntry.imageData,
+        exportEntry.width,
+        exportEntry.height,
+        settings,
+        currentBounds
+      )
+    );
+    if (exportToken !== myToken) return;
+
+    fallbackFinal = fallbackDisplaced;
+    const fallbackDispTriCount = fallbackDisplaced.attributes.position.count / 3;
+    if (fallbackDispTriCount > settings.maxTriangles) {
+      fallbackFinal = await runAsync(() =>
+        decimate(
+          fallbackDisplaced,
+          settings.maxTriangles
+        )
+      );
+      if (exportToken !== myToken) return;
+    }
+
+    const fallbackStageTriCounts = {
+      subdivision: fallbackSubdivided.attributes.position.count / 3,
+      displacement: fallbackDisplaced.attributes.position.count / 3,
+      final: fallbackFinal.attributes.position.count / 3,
+    };
+
+    if (
+      fallbackStageTriCounts.subdivision !== workerStageTriCounts.subdivision ||
+      fallbackStageTriCounts.displacement !== workerStageTriCounts.displacement ||
+      fallbackStageTriCounts.final !== workerStageTriCounts.final
+    ) {
+      console.error('[export][debug-parity] Worker/fallback triangle-count mismatch.', {
+        worker: workerStageTriCounts,
+        fallback: fallbackStageTriCounts,
+      });
+    } else {
+      console.info('[export][debug-parity] Worker/fallback triangle counts match.', workerStageTriCounts);
+    }
+  } finally {
+    if (fallbackSubdivided) releaseGeometryBuffers(fallbackSubdivided, 'debug-parity-subdivided');
+    if (fallbackDisplaced && fallbackDisplaced !== fallbackSubdivided) {
+      releaseGeometryBuffers(fallbackDisplaced, 'debug-parity-displaced');
+    }
+    if (fallbackFinal && fallbackFinal !== fallbackDisplaced && fallbackFinal !== fallbackSubdivided) {
+      releaseGeometryBuffers(fallbackFinal, 'debug-parity-final');
+    }
+  }
 }
