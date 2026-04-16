@@ -58,6 +58,8 @@ let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
 let exportWorker          = null;
+let exportWorkerState     = 'unknown'; // 'unknown' | 'operational' | 'permanent-fallback'
+let exportWorkerReason    = '';
 const EXPORT_STAGE_DEBUG = /\bexportStageDebug=1\b/.test(window.location.search);
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
@@ -600,13 +602,16 @@ function analyzeTextureQuality(entry) {
   const data = imageData.data;
   const pxCount = width * height;
   const hist = new Uint32Array(256);
+  const gray = new Uint8Array(pxCount);
   let sumL = 0;
   let sumL2 = 0;
   let colorDiffSum = 0;
 
-  for (let i = 0; i < data.length; i += 4) {
+  for (let i = 0, px = 0; i < data.length; i += 4, px++) {
     const r = data[i], g = data[i + 1], b = data[i + 2];
+    // Keep seam checks in the same perceptual space as the histogram metrics.
     const l = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    gray[px] = l;
     hist[l]++;
     sumL += l;
     sumL2 += l * l;
@@ -624,14 +629,12 @@ function analyzeTextureQuality(entry) {
 
   let seamAcc = 0;
   for (let y = 0; y < height; y++) {
-    const lOff = (y * width) * 4;
-    const rOff = (y * width + (width - 1)) * 4;
-    seamAcc += Math.abs(data[lOff] - data[rOff]);
+    const rowOff = y * width;
+    seamAcc += Math.abs(gray[rowOff] - gray[rowOff + (width - 1)]);
   }
+  const lastRowOff = (height - 1) * width;
   for (let x = 0; x < width; x++) {
-    const tOff = x * 4;
-    const bOff = ((height - 1) * width + x) * 4;
-    seamAcc += Math.abs(data[tOff] - data[bOff]);
+    seamAcc += Math.abs(gray[x] - gray[lastRowOff + x]);
   }
   const seamScore = seamAcc / ((width + height) * 255);
 
@@ -660,12 +663,12 @@ function validateTextureEntry(entry) {
     issues.push({ level: 'warn', message: t('textureValidation.lowContrast') });
   }
 
-  if (metrics.clipLow + metrics.clipHigh > 0.20) {
-    issues.push({ level: 'warn', message: t('textureValidation.clipping') });
+  if (metrics.clipLow + metrics.clipHigh > 0.18) {
+    issues.push({ level: 'warn', message: 'Histogram clipping detected; details may crush at min/max height.' });
   }
 
-  if (metrics.seamScore > 0.12) {
-    issues.push({ level: 'warn', message: t('textureValidation.seamMismatch') });
+  if (metrics.seamScore > 0.10) {
+    issues.push({ level: 'warn', message: 'High seam mismatch score; tiling seams may be visible.' });
   }
 
   const severity = issues.some(i => i.level === 'error')
@@ -4045,11 +4048,25 @@ async function handleExport(format = 'stl') {
     const exportEntry = getEffectiveMapEntry();
     let safetyCapHit = false;
     let workerDecimationFailed = false;
+    let workerStageTriCounts = null;
     try {
-      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed } =
+      ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed, stageTriCounts: workerStageTriCounts } =
         await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
+      if (EXPORT_STAGE_DEBUG) {
+        await runExportParityTriangleCheck(faceWeights, exportEntry, myToken, workerStageTriCounts);
+        if (exportToken !== myToken) return;
+      }
     } catch (workerErr) {
-      console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
+      const permanentFallback = exportWorkerState === 'permanent-fallback';
+      const workerTelemetryState = permanentFallback ? 'permanent-fallback' : 'fallback-this-run';
+      const reason = workerErr?.message || String(workerErr);
+      console.warn(
+        `[export][worker-path:${workerTelemetryState}] ` +
+        (permanentFallback
+          ? 'Worker path is disabled; main-thread fallback is now permanent.'
+          : 'Worker path failed this export; using main-thread fallback for this run.'),
+        { reason, workerState: exportWorkerState }
+      );
       ({ geometry: subdivided, safetyCapHit } = await subdivide(
         currentGeometry, settings.refineLength,
         (p, triCount, longestEdge) => {
@@ -4272,8 +4289,17 @@ function yieldFrame() {
 }
 
 function _ensureExportWorker() {
+  if (exportWorkerState === 'permanent-fallback') {
+    throw new Error(exportWorkerReason || 'Export worker disabled: permanent fallback mode.');
+  }
   if (exportWorker) return exportWorker;
-  exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  try {
+    exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  } catch (err) {
+    exportWorkerState = 'permanent-fallback';
+    exportWorkerReason = err?.message || String(err);
+    throw new Error(`Export worker init failed (permanent fallback): ${exportWorkerReason}`);
+  }
   return exportWorker;
 }
 
@@ -4316,9 +4342,15 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
   };
 
   return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      worker.removeEventListener('message', onMessage);
+      worker.removeEventListener('error', onError);
+      worker.removeEventListener('messageerror', onMessageError);
+    };
+
     const onMessage = (evt) => {
       if (exportToken !== myToken) {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
         reject(new Error('Stale export worker result'));
         return;
       }
@@ -4353,7 +4385,9 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
         return;
       }
       if (data.type === 'result') {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
+        exportWorkerState = 'operational';
+        exportWorkerReason = '';
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
         geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
@@ -4361,15 +4395,32 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
           geometry: geo,
           safetyCapHit: !!data.safetyCapHit,
           decimationFailed: !!data.decimationFailed,
+          stageTriCounts: data.stageTriCounts || null,
         });
         return;
       }
       if (data.type === 'error') {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
         reject(new Error(data.message || 'Worker processing failed'));
       }
     };
+    const onError = (evt) => {
+      cleanup();
+      if (exportWorker) {
+        exportWorker.terminate();
+        exportWorker = null;
+      }
+      exportWorkerState = 'permanent-fallback';
+      exportWorkerReason = evt?.message || 'Worker runtime error';
+      reject(new Error(`Export worker runtime error (permanent fallback): ${exportWorkerReason}`));
+    };
+    const onMessageError = () => {
+      cleanup();
+      reject(new Error('Export worker message transport error'));
+    };
     worker.addEventListener('message', onMessage);
+    worker.addEventListener('error', onError);
+    worker.addEventListener('messageerror', onMessageError);
     worker.postMessage(payload, [
       payload.geometry.position.buffer,
       payload.geometry.normal.buffer,
@@ -4377,4 +4428,72 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
       ...(payload.geometry.excludeWeight ? [payload.geometry.excludeWeight.buffer] : []),
     ]);
   });
+}
+
+async function runExportParityTriangleCheck(faceWeights, exportEntry, myToken, workerStageTriCounts) {
+  if (!workerStageTriCounts) return;
+
+  let fallbackSubdivided = null;
+  let fallbackDisplaced = null;
+  let fallbackFinal = null;
+  try {
+    ({ geometry: fallbackSubdivided } = await subdivide(
+      currentGeometry,
+      settings.refineLength,
+      null,
+      faceWeights
+    ));
+    if (exportToken !== myToken) return;
+
+    fallbackDisplaced = await runAsync(() =>
+      applyDisplacement(
+        fallbackSubdivided,
+        exportEntry.imageData,
+        exportEntry.width,
+        exportEntry.height,
+        settings,
+        currentBounds
+      )
+    );
+    if (exportToken !== myToken) return;
+
+    fallbackFinal = fallbackDisplaced;
+    const fallbackDispTriCount = fallbackDisplaced.attributes.position.count / 3;
+    if (fallbackDispTriCount > settings.maxTriangles) {
+      fallbackFinal = await runAsync(() =>
+        decimate(
+          fallbackDisplaced,
+          settings.maxTriangles
+        )
+      );
+      if (exportToken !== myToken) return;
+    }
+
+    const fallbackStageTriCounts = {
+      subdivision: fallbackSubdivided.attributes.position.count / 3,
+      displacement: fallbackDisplaced.attributes.position.count / 3,
+      final: fallbackFinal.attributes.position.count / 3,
+    };
+
+    if (
+      fallbackStageTriCounts.subdivision !== workerStageTriCounts.subdivision ||
+      fallbackStageTriCounts.displacement !== workerStageTriCounts.displacement ||
+      fallbackStageTriCounts.final !== workerStageTriCounts.final
+    ) {
+      console.error('[export][debug-parity] Worker/fallback triangle-count mismatch.', {
+        worker: workerStageTriCounts,
+        fallback: fallbackStageTriCounts,
+      });
+    } else {
+      console.info('[export][debug-parity] Worker/fallback triangle counts match.', workerStageTriCounts);
+    }
+  } finally {
+    if (fallbackSubdivided) releaseGeometryBuffers(fallbackSubdivided, 'debug-parity-subdivided');
+    if (fallbackDisplaced && fallbackDisplaced !== fallbackSubdivided) {
+      releaseGeometryBuffers(fallbackDisplaced, 'debug-parity-displaced');
+    }
+    if (fallbackFinal && fallbackFinal !== fallbackDisplaced && fallbackFinal !== fallbackSubdivided) {
+      releaseGeometryBuffers(fallbackFinal, 'debug-parity-final');
+    }
+  }
 }
