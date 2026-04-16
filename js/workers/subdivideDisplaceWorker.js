@@ -49,7 +49,6 @@ function releaseGeometryBuffers(geo, label = '', debugStageStats = false) {
 self.onmessage = async (e) => {
   const msg = e.data;
   if (!msg || msg.type !== 'run') return;
-  const stageStats = { maxObservedMB: 0 };
 
   let subdivided = null;
   let displaced = null;
