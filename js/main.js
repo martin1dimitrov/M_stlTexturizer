@@ -2734,7 +2734,7 @@ function collectExportValidation() {
   return {
     warnings,
     errors,
-    estimate: hasGeometry ? _estimateExportRanges() : null,
+    estimate: _estimateExportRanges(),
   };
 }
 
