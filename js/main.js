@@ -595,13 +595,16 @@ function analyzeTextureQuality(entry) {
   const data = imageData.data;
   const pxCount = width * height;
   const hist = new Uint32Array(256);
+  const gray = new Uint8Array(pxCount);
   let sumL = 0;
   let sumL2 = 0;
   let colorDiffSum = 0;
 
-  for (let i = 0; i < data.length; i += 4) {
+  for (let i = 0, px = 0; i < data.length; i += 4, px++) {
     const r = data[i], g = data[i + 1], b = data[i + 2];
+    // Keep seam checks in the same perceptual space as the histogram metrics.
     const l = Math.round(0.2126 * r + 0.7152 * g + 0.0722 * b);
+    gray[px] = l;
     hist[l]++;
     sumL += l;
     sumL2 += l * l;
@@ -619,14 +622,12 @@ function analyzeTextureQuality(entry) {
 
   let seamAcc = 0;
   for (let y = 0; y < height; y++) {
-    const lOff = (y * width) * 4;
-    const rOff = (y * width + (width - 1)) * 4;
-    seamAcc += Math.abs(data[lOff] - data[rOff]);
+    const rowOff = y * width;
+    seamAcc += Math.abs(gray[rowOff] - gray[rowOff + (width - 1)]);
   }
+  const lastRowOff = (height - 1) * width;
   for (let x = 0; x < width; x++) {
-    const tOff = x * 4;
-    const bOff = ((height - 1) * width + x) * 4;
-    seamAcc += Math.abs(data[tOff] - data[bOff]);
+    seamAcc += Math.abs(gray[x] - gray[lastRowOff + x]);
   }
   const seamScore = seamAcc / ((width + height) * 255);
 
@@ -655,11 +656,11 @@ function validateTextureEntry(entry) {
     issues.push({ level: 'warn', message: 'Low contrast histogram; displacement may look flat.' });
   }
 
-  if (metrics.clipLow + metrics.clipHigh > 0.20) {
+  if (metrics.clipLow + metrics.clipHigh > 0.18) {
     issues.push({ level: 'warn', message: 'Histogram clipping detected; details may crush at min/max height.' });
   }
 
-  if (metrics.seamScore > 0.12) {
+  if (metrics.seamScore > 0.10) {
     issues.push({ level: 'warn', message: 'High seam mismatch score; tiling seams may be visible.' });
   }
 
