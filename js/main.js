@@ -224,6 +224,8 @@ const wireframeToggle  = document.getElementById('wireframe-toggle');
 const projectionToggle = document.getElementById('projection-toggle');
 const overlayModeSelect = document.getElementById('overlay-mode');
 const splitViewToggle   = document.getElementById('split-view-toggle');
+const diagSignedDispToggle = document.getElementById('diag-signed-disp-toggle');
+const diagTriDensityToggle = document.getElementById('diag-tri-density-toggle');
 const placeOnFaceBtn   = document.getElementById('place-on-face-btn');
 const beginnerModeToggle = document.getElementById('beginner-mode-toggle');
 
