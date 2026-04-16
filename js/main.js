@@ -17,10 +17,8 @@ import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions, getShellAssignments } from './meshValidation.js';
-import { analyzeTextureQuality, classifyTextureQuality, EXPORT_PRESETS, derivePresetSettings, collectExportValidationCore } from './exportValidationCore.js';
-import { computeUV } from './mapping.js';
+import { derivePresetSettings } from './exportValidationCore.js';
 import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
-import { computeUV } from './mapping.js';
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
@@ -58,6 +56,8 @@ let _shiftLineMesh     = null;        // THREE.Line — preview line from last p
 let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
+let lastVaseMetrics       = null;
+let vaseValidationCache   = { key: '', metrics: null };
 let exportWorker          = null;
 let exportWorkerState     = 'unknown'; // 'unknown' | 'operational' | 'permanent-fallback'
 let exportWorkerReason    = '';
