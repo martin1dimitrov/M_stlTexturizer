@@ -1,7 +1,7 @@
 import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js';
-import { subdivide } from '../subdivision.js';
-import { applyDisplacement } from '../displacement.js';
-import { decimate } from '../decimation.js';
+import { subdivide } from './subdivision.worker.js';
+import { applyDisplacement } from './displacement.worker.js';
+import { decimate } from './decimation.worker.js';
 
 function buildGeometry(position, normal, excludeWeight = null) {
   const geo = new THREE.BufferGeometry();
@@ -53,6 +53,7 @@ self.onmessage = async (e) => {
   let subdivided = null;
   let displaced = null;
   let finalGeometry = null;
+  const stageStats = { maxObservedMB: 0 };
 
   try {
     const geometry = buildGeometry(msg.geometry.position, msg.geometry.normal, msg.geometry.excludeWeight);

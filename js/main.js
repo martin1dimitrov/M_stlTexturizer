@@ -58,6 +58,8 @@ let _lastEffectiveTexture = null;
 let _effectiveMapCache    = null;
 let _effectiveMapCacheKey = null;
 let exportWorker          = null;
+let exportWorkerState     = 'unknown'; // 'unknown' | 'operational' | 'permanent-fallback'
+let exportWorkerReason    = '';
 const EXPORT_STAGE_DEBUG = /\bexportStageDebug=1\b/.test(window.location.search);
 
 // ── Spatial grid state (must precede loadDefaultCube call) ────────────────────
@@ -4035,7 +4037,16 @@ async function handleExport(format = 'stl') {
       ({ geometry: displaced, safetyCapHit, decimationFailed: workerDecimationFailed } =
         await runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken));
     } catch (workerErr) {
-      console.warn('Worker export path failed, falling back to main-thread pipeline:', workerErr);
+      const permanentFallback = exportWorkerState === 'permanent-fallback';
+      const workerTelemetryState = permanentFallback ? 'permanent-fallback' : 'fallback-this-run';
+      const reason = workerErr?.message || String(workerErr);
+      console.warn(
+        `[export][worker-path:${workerTelemetryState}] ` +
+        (permanentFallback
+          ? 'Worker path is disabled; main-thread fallback is now permanent.'
+          : 'Worker path failed this export; using main-thread fallback for this run.'),
+        { reason, workerState: exportWorkerState }
+      );
       ({ geometry: subdivided, safetyCapHit } = await subdivide(
         currentGeometry, settings.refineLength,
         (p, triCount, longestEdge) => {
@@ -4258,8 +4269,17 @@ function yieldFrame() {
 }
 
 function _ensureExportWorker() {
+  if (exportWorkerState === 'permanent-fallback') {
+    throw new Error(exportWorkerReason || 'Export worker disabled: permanent fallback mode.');
+  }
   if (exportWorker) return exportWorker;
-  exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  try {
+    exportWorker = new Worker('./js/workers/subdivideDisplaceWorker.js', { type: 'module' });
+  } catch (err) {
+    exportWorkerState = 'permanent-fallback';
+    exportWorkerReason = err?.message || String(err);
+    throw new Error(`Export worker init failed (permanent fallback): ${exportWorkerReason}`);
+  }
   return exportWorker;
 }
 
@@ -4302,9 +4322,15 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
   };
 
   return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      worker.removeEventListener('message', onMessage);
+      worker.removeEventListener('error', onError);
+      worker.removeEventListener('messageerror', onMessageError);
+    };
+
     const onMessage = (evt) => {
       if (exportToken !== myToken) {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
         reject(new Error('Stale export worker result'));
         return;
       }
@@ -4339,7 +4365,9 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
         return;
       }
       if (data.type === 'result') {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
+        exportWorkerState = 'operational';
+        exportWorkerReason = '';
         const geo = new THREE.BufferGeometry();
         geo.setAttribute('position', new THREE.BufferAttribute(data.position, 3));
         geo.setAttribute('normal', new THREE.BufferAttribute(data.normal, 3));
@@ -4351,11 +4379,27 @@ async function runSubdivideDisplaceWorker(faceWeights, exportEntry, myToken) {
         return;
       }
       if (data.type === 'error') {
-        worker.removeEventListener('message', onMessage);
+        cleanup();
         reject(new Error(data.message || 'Worker processing failed'));
       }
     };
+    const onError = (evt) => {
+      cleanup();
+      if (exportWorker) {
+        exportWorker.terminate();
+        exportWorker = null;
+      }
+      exportWorkerState = 'permanent-fallback';
+      exportWorkerReason = evt?.message || 'Worker runtime error';
+      reject(new Error(`Export worker runtime error (permanent fallback): ${exportWorkerReason}`));
+    };
+    const onMessageError = () => {
+      cleanup();
+      reject(new Error('Export worker message transport error'));
+    };
     worker.addEventListener('message', onMessage);
+    worker.addEventListener('error', onError);
+    worker.addEventListener('messageerror', onMessageError);
     worker.postMessage(payload, [
       payload.geometry.position.buffer,
       payload.geometry.normal.buffer,
