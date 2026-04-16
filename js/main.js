@@ -17,6 +17,7 @@ import { buildAdjacency, bucketFill,
          buildExclusionOverlayGeo, buildFaceWeights } from './exclusion.js';
 import { runFastDiagnostics, runExpensiveDiagnostics,
          getEdgePositions, getShellAssignments } from './meshValidation.js';
+import { analyzeTextureQuality, classifyTextureQuality, EXPORT_PRESETS, derivePresetSettings, collectExportValidationCore } from './exportValidationCore.js';
 import { computeUV } from './mapping.js';
 import { t, initLang, setLang, getLang, applyTranslations, TRANSLATIONS } from './i18n.js';
 import { computeUV } from './mapping.js';
@@ -1883,14 +1884,6 @@ function updateBucketHover(e) {
 // ── Slider helper ─────────────────────────────────────────────────────────────
 
 const INPUT_WHEEL_DECIMALS = 3;
-const EXPORT_PRESETS = {
-  fast:     { refineLength: 1.5, maxTriangles: 300_000 },
-  balanced: { refineLength: 1.0, maxTriangles: 750_000 },
-  high:     { refineLength: 0.35, maxTriangles: 2_000_000 },
-  vase:     { refineLength: 0.45, maxTriangles: 1_200_000 },
-  large:    { refineLength: 1.6, maxTriangles: 500_000 },
-};
-
 function getInputPrecision(input) {
   const configured = parseInt(input.dataset.wheelDecimals, 10);
   if (!isNaN(configured) && configured >= 0) return configured;
@@ -1956,16 +1949,16 @@ function addFineWheelSupport(input, applyFn) {
 }
 
 function applyExportPreset(presetKey) {
-  const preset = EXPORT_PRESETS[presetKey];
-  if (!preset) return;
-  settings.vaseModeSafe = presetKey === 'vase';
+  const nextSettings = derivePresetSettings(settings, presetKey);
+  if (!nextSettings) return;
+  settings.vaseModeSafe = nextSettings.vaseModeSafe;
   if (vaseModeSafeToggle) vaseModeSafeToggle.checked = settings.vaseModeSafe;
-  settings.refineLength = preset.refineLength;
-  settings.maxTriangles = preset.maxTriangles;
-  refineLenSlider.value = preset.refineLength;
-  refineLenVal.value = formatInputValue(refineLenVal, preset.refineLength);
-  maxTriSlider.value = preset.maxTriangles;
-  maxTriVal.textContent = formatM(preset.maxTriangles);
+  settings.refineLength = nextSettings.refineLength;
+  settings.maxTriangles = nextSettings.maxTriangles;
+  refineLenSlider.value = nextSettings.refineLength;
+  refineLenVal.value = formatInputValue(refineLenVal, nextSettings.refineLength);
+  maxTriSlider.value = nextSettings.maxTriangles;
+  maxTriVal.textContent = formatM(nextSettings.maxTriangles);
   checkResolutionWarning();
   renderExportValidation();
   clearTimeout(previewDebounce);
@@ -2739,7 +2732,7 @@ function collectExportValidation() {
   return {
     warnings,
     errors,
-    estimate: _estimateExportRanges(),
+    estimate: hasGeometry ? _estimateExportRanges() : null,
   };
 }
 
