@@ -1,0 +1,14 @@
+{
+  "name": "m_stltexturizer",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "test:unit": "vitest run test/unit",
+    "test:integration": "vitest run test/integration"
+  },
+  "devDependencies": {
+    "three": "^0.170.0",
+    "vitest": "^2.1.8"
+  }
+}
